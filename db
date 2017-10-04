@@ -1,0 +1,32 @@
+#!/usr/bin/sh
+
+ORATAB=/etc/oratab
+oracle_sid_bck=$ORACLE_SID
+orah9=/u01_9i/oracle9i/product/9.2.0
+orah10=/u01_10g/oracle10/product/10.2.0
+
+
+if [ $# -eq 1 ]
+then
+        export ORACLE_SID=$1
+        cd
+        cd scripts/dbatools
+        sqlplus "/ as sysdba" @/u01_9i/oracle9i/scripts/dbatools/insta.sql
+
+
+else
+        echo "Falta meter la instancia a conectar"
+        echo ""
+        echo "============= ORACLE9i ====================="
+        egrep -i ":Y|:N" $ORATAB | cut -d":" -f1,2|egrep -e $orah9 | cut -d":" -f1 | grep -v "\#" | grep -v "\*"
+        echo ""
+        echo ""
+        echo "============= ORACLE10 ====================="
+        egrep -i ":Y|:N" $ORATAB | cut -d":" -f1,2|egrep -e $orah10 | cut -d":" -f1 | grep -v "\#" | grep -v "\*"
+        echo ""
+        echo "Usage: db <nombre_instancia>"
+        echo ""
+        exit 1
+fi
+
+export ORACLE_SID=$oracle_sid_bck

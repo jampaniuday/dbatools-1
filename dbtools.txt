@@ -1,0 +1,3333 @@
+------------------------------------------------------------------------------
+** dbatools
+https://github.com/sguinales/oraclework/
+
+
+@index
+Rem ================================================== dbatools ===========
+Rem = ACTIVIDAD SESIONES ==================================================
+Rem ==	@bdperf ------- Vision general:  wevents, sessions, Top,etc...
+Rem ==	@ses ------- wait events + active sessions + sqls
+Rem ==	@pxses -------- paralel execution info
+Rem ==	@vercur ------- Explain plan de sql en ejecucion. cursor.
+Rem ==	@stats -------- Session stats by a specific SID
+Rem ==	@sqltune ------ Sql tuning advisor findings and recomend.
+Rem ==	@versql ------- Un sql concreto por id.
+Rem ==	@useract ------ actividad de usuarios.
+Rem ==	@verun -------- procesos/sesiones corriendo activas.
+Rem ==	@versqls ------ Todas las sql en ejecucion
+Rem ==	@cursores ----- Que cursores usa un usuario.
+Rem ==	@longo -------- long running operations.
+Rem = TROUBLESHOTING ======================================================
+Rem ==	@verwait ------ Esperas.
+Rem ==	@alert -------- revision alertas bd, alertlog
+Rem ==	@locks -------- bloqueos y como sentencia de resolucion.
+Rem ==	@topsql ------- top SQL % y lista de SQL.
+Rem ==	@racdiag ------ troubleshoot RAC.
+Rem = BD INFO ==============================================================
+Rem ==  @infodb ------- info para recrear bd
+Rem ==	@tbsp --------- ocupacion de tablespaces y asm
+Rem ==	@verhwm ------- espacio disoponible de datafile con/sin HWM
+Rem ==	@verbackups --- informacion sobre backups y export en curso
+Rem ==	@verjobs ------ Jobs corriendo y lista todos
+Rem ==	@verasm ------- Ver info de asm: disco,ficheros,grupos
+Rem ==	@verbd -------- all database sessions are currently doing wait/CPU usag.
+Rem ==	@vertab ------- Informacion detallada tabla.
+Rem ==	@veridx ------- Informacion detallada indice.
+Rem ==	@vertemp ------ Informacion y uso del Temporal.
+Rem ==	@verundo ------ informacion sobre el undo
+Rem ==	@verinvalid --- Indices y objetos invalidos
+Rem ==	@redogen ------ redo info.
+Rem ==	@vercursores -- Uso de cursores. todos los usuarios
+Rem ==	@oralic ------- Check uso caracteristicas con licencia de ORACLE
+Rem ==	@vertam ------- multiple sizes of database: bd,ts,
+Rem ==	@tams --------- size of schema
+Rem ==	@tamt --------- size of a table
+Rem ==	@tambd -------- Size of all extends
+Rem ==	@dg ----------- Checks to dataguard
+Rem = ACTIVIDAD CPU/IO ======================================================
+Rem ==	@topcpu ------- top CPU and Top SQL CPU activity% using SQL
+Rem ==	@sqlrt  ------- Top SQL Response TIME last 2h
+Rem ==	@tps  --------- TPS (Transactions/s) from snaps
+Rem ==	@filestat ----- Report v$filestat, reporta I/O de los discos.
+Rem ==  @verio -------- physical IO: redo size, physical reads and physical writes
+Rem ==	@verlecturas -- top Sesiones Lecturas Fisicas/Logicas 
+Rem = INSTANCIA / MEMORIA ===================================================
+Rem ==  @vermem  ------- memoria info.
+Rem ==	@ratios ------- % ratios de uso de instancia.
+Rem ==	@sqlarea ------ dump a SQL library -> cache en /tmp/sqlarea.&m_timestamp
+Rem ==	@versorts ----- sorts memoria/disco, media de sorts,etc...
+Rem == [STANDBY / DATAGUARD] ================================================
+Rem ==	@stdby -------- status managed standby
+Rem =======================================================================
+
+@alert ------------------------------------------------------------------------------------------
+set feedback off
+SET NEWPAGE NONE
+SET PAGESIZE 1000
+set lines 120
+set echo off
+set heading off
+
+select to_char(ORIGINATING_TIMESTAMP, 'dd-mon-yyyy hh24:mi:ss'),
+substr(MESSAGE_TEXT, 1, 300) message_text
+from x$dbgalertext
+where (MESSAGE_TEXT like '%ORA-%'
+or upper(MESSAGE_TEXT) like '%ERROR%'
+or MESSAGE_TEXT like '%Starting up%')
+and cast(ORIGINATING_TIMESTAMP as DATE) > sysdate - 60
+and MESSAGE_TEXT not like '%ORA-29400%'
+and MESSAGE_TEXT not like '%GATHER_STATS_JOB%'
+and MESSAGE_TEXT not like '%error 19502%'
+and MESSAGE_TEXT not like '%error 12545%'
+and MESSAGE_TEXT not like '%Fatal NI%'
+and MESSAGE_TEXT not like '%se ha producido un error a nivel 2%'
+and MESSAGE_TEXT not like '%error occurred at recursive SQL level 2%'
+and MESSAGE_TEXT not like '%Tns error struct%'
+and MESSAGE_TEXT not like '%SQL recursivo ORA-01502: el indice%';
+
+
+@bdperf ------------------------------------------------------------------------------------------
+
+--		.: Script to find Oracle database performance
+
+--			This single script provides the overall picture of the database 
+-- 			in terms of Waits events, Active/Inactive killed sessions, Top 
+--			Processes (physical I/O, logical I/O, memory and CPU processes), 
+--			Top CPU usage by users, etc.
+
+set serveroutput on
+declare 
+cursor c1 is select version
+from v$instance;
+cursor c2 is
+    select
+          host_name
+       ,  instance_name
+       ,  to_char(sysdate, 'HH24:MI:SS DD-MON-YY') currtime
+       ,  to_char(startup_time, 'HH24:MI:SS DD-MON-YY') starttime
+     from v$instance;
+cursor c4 is
+select * from (SELECT count(*) cnt, substr(event,1,50) event
+FROM v$session_wait
+WHERE wait_time = 0
+AND event NOT IN ('smon timer','pipe get','wakeup time manager','pmon timer','rdbms ipc message',
+'SQL*Net message from client')
+GROUP BY event
+ORDER BY 1 DESC) where rownum <6;
+cursor c5 is
+select round(sum(value)/1048576) as sgasize from v$sga;
+cursor c6 is select round(sum(bytes)/1048576) as dbsize
+from v$datafile;
+cursor c7 is select 'top physical i/o process' category, sid,
+       username, total_user_io amt_used,
+       round(100 * total_user_io/total_io,2) pct_used
+from (select b.sid sid, nvl(b.username, p.name) username,
+             sum(value) total_user_io
+      from v$statname c, v$sesstat a,
+           v$session b, v$bgprocess p
+      where a.statistic# = c.statistic#
+      and p.paddr (+) = b.paddr
+      and b.sid = a.sid
+      and c.name in ('physical reads', 'physical writes',
+                     'physical reads direct',
+                     'physical reads direct (lob)',
+                     'physical writes direct',
+                     'physical writes direct (lob)')
+      and b.username not in ('SYS', 'SYSTEM', 'SYSMAN', 'DBSNMP')
+      group by b.sid, nvl(b.username, p.name)
+      order by 3 desc),
+     (select sum(value) total_io
+      from v$statname c, v$sesstat a
+      where a.statistic# = c.statistic#
+      and c.name in ('physical reads', 'physical writes',
+                       'physical reads direct',
+                       'physical reads direct (lob)',
+                       'physical writes direct',
+                       'physical writes direct (lob)'))
+where rownum < 2
+union all
+select 'top logical i/o process', sid, username,
+       total_user_io amt_used,
+       round(100 * total_user_io/total_io,2) pct_used
+from (select b.sid sid, nvl(b.username, p.name) username,
+             sum(value) total_user_io
+      from v$statname c, v$sesstat a,
+           v$session b, v$bgprocess p
+      where a.statistic# = c.statistic#
+      and p.paddr (+) = b.paddr
+      and b.sid = a.sid
+      and c.name in ('consistent gets', 'db block gets')
+      and b.username not in ('SYS', 'SYSTEM', 'SYSMAN', 'DBSNMP')
+      group by b.sid, nvl(b.username, p.name)
+      order by 3 desc),
+     (select sum(value) total_io
+      from v$statname c, v$sesstat a,
+           v$session b, v$bgprocess p
+      where a.statistic# = c.statistic#
+      and p.paddr (+) = b.paddr
+ and b.sid = a.sid
+      and c.name in ('consistent gets', 'db block gets'))
+where rownum < 2
+union all
+select 'top memory process', sid,
+       username, total_user_mem,
+       round(100 * total_user_mem/total_mem,2)
+from (select b.sid sid, nvl(b.username, p.name) username,
+             sum(value) total_user_mem
+      from v$statname c, v$sesstat a,
+           v$session b, v$bgprocess p
+      where a.statistic# = c.statistic#
+      and p.paddr (+) = b.paddr
+      and b.sid = a.sid
+      and c.name in ('session pga memory', 'session uga memory')
+      and b.username not in ('SYS', 'SYSTEM', 'SYSMAN', 'DBSNMP')
+      group by b.sid, nvl(b.username, p.name)
+      order by 3 desc),
+     (select sum(value) total_mem
+      from v$statname c, v$sesstat a
+      where a.statistic# = c.statistic#
+      and c.name in ('session pga memory', 'session uga memory'))
+where rownum < 2
+union all
+select 'top cpu process', sid, username,
+       total_user_cpu,
+       round(100 * total_user_cpu/greatest(total_cpu,1),2)
+from (select b.sid sid, nvl(b.username, p.name) username,
+             sum(value) total_user_cpu
+      from v$statname c, v$sesstat a,
+           v$session b, v$bgprocess p
+      where a.statistic# = c.statistic#
+      and p.paddr (+) = b.paddr
+      and b.sid = a.sid
+      and c.name = 'CPU used by this session'
+      and b.username not in ('SYS', 'SYSTEM', 'SYSMAN', 'DBSNMP')
+      group by b.sid, nvl(b.username, p.name)
+      order by 3 desc),
+     (select sum(value) total_cpu
+      from v$statname c, v$sesstat a,
+           v$session b, v$bgprocess p
+      where a.statistic# = c.statistic#
+      and p.paddr (+) = b.paddr
+      and b.sid = a.sid
+      and c.name = 'CPU used by this session')
+where rownum < 2;
+
+
+cursor c8 is select username, sum(VALUE/100) cpu_usage_sec
+from v$session ss, v$sesstat se, v$statname sn
+where se.statistic# = sn.statistic#
+and name like '%CPU used by this session%'
+and se.sid = ss.sid
+and username is not null
+and username not in ('SYS', 'SYSTEM', 'SYSMAN', 'DBSNMP')
+group by username
+order by 2 desc;
+begin
+dbms_output.put_line ('Database Version');
+dbms_output.put_line ('-----------------');
+for rec in c1
+loop
+dbms_output.put_line(rec.version);
+end loop;
+dbms_output.put_line( chr(13) );
+dbms_output.put_line('Hostname');
+dbms_output.put_line ('----------');
+for rec in c2
+loop
+     dbms_output.put_line(rec.host_name);
+end loop;
+dbms_output.put_line( chr(13) );
+dbms_output.put_line('SGA Size (MB)');
+dbms_output.put_line ('-------------');
+for rec in c5
+loop
+     dbms_output.put_line(rec.sgasize);
+end loop;
+dbms_output.put_line( chr(13) );
+dbms_output.put_line('Database Size (MB)');
+dbms_output.put_line ('-----------------');
+for rec in c6
+loop
+     dbms_output.put_line(rec.dbsize);
+end loop;
+dbms_output.put_line( chr(13) );
+dbms_output.put_line('Instance start-up time');
+dbms_output.put_line ('-----------------------');
+for rec in c2 loop
+ dbms_output.put_line( rec.starttime );
+  end loop;
+dbms_output.put_line( chr(13) );
+  for b in
+    (select total, active, inactive, system, killed
+    from
+       (select count(*) total from v$session)
+     , (select count(*) system from v$session where username is null)
+     , (select count(*) active from v$session where status = 'ACTIVE' and username is not null)
+
+
+     , (select count(*) inactive from v$session where status = 'INACTIVE')
+     , (select count(*) killed from v$session where status = 'KILLED')) loop
+dbms_output.put_line('Active Sessions');
+dbms_output.put_line ('---------------');
+dbms_output.put_line(b.total || ' sessions: ' || b.inactive || ' inactive,' || b.active || ' active, ' || b.system || ' system, ' || b.killed || ' killed ');
+  end loop;
+  dbms_output.put_line( chr(13) );
+ dbms_output.put_line( 'Sessions Waiting' );
+  dbms_output.put_line( chr(13) );
+dbms_output.put_line('Count      Event Name');
+dbms_output.put_line('-----      -----------------------------------------------------');
+for rec in c4 
+loop
+dbms_output.put_line(rec.cnt||'          '||rec.event);
+end loop;
+dbms_output.put_line( chr(13) );
+
+
+dbms_output.put_line('-----      -----------------------------------------------------');
+
+
+dbms_output.put_line('TOP Physical i/o, logical i/o, memory and CPU processes');
+dbms_output.put_line ('---------------');
+for rec in c7
+loop
+dbms_output.put_line (rec.category||': SID '||rec.sid||' User : '||rec.username||': Amount used : '||rec.amt_used||': Percent used: '||rec.pct_used);
+end loop;
+
+
+dbms_output.put_line('------------------------------------------------------------------');
+
+
+dbms_output.put_line('TOP CPU users by usage');
+dbms_output.put_line ('---------------');
+for rec in c8
+loop
+
+
+dbms_output.put_line (rec.username||'--'||rec.cpu_usage_sec);
+dbms_output.put_line ('---------------');
+end loop;
+
+
+end;
+/
+
+
+@filestat ------------------------------------------------------------------------------------------
+Set echo off
+set timing off
+Set Linesize 200
+Set Pagesize 45
+Set Desc Linenum On
+
+Set Arraysize 1
+Set Long 2000
+Set Serveroutput On size 800000 ;
+
+Set Heading  on
+Set Feedback Off
+Set Verify   Off
+
+
+rem
+rem     Script:        filestat.sql
+rem     Author:        J.P.Lewis
+rem     Dated:         Lost in the mists of time
+rem     Purpose:       Report v$filestat
+rem
+rem     Notes:
+rem     m_timestamp has been defined before this report is called
+rem     usually through a loop which calculates the date and time.
+rem
+rem     Spot the little fix for avoiding the divide by zero error.
+rem
+rem     The headings have no spaces to cater for awk further down.
+rem
+rem     The code has to be run by a user who can see v$filestat
+rem
+
+Ttitle  ' [ I/O Data Files ]'  skip 1
+set trimspool on
+set pagesize 1023
+
+ttitle off
+btitle off
+clear columns
+clear breaks
+column  file#          format  9999   heading "File"
+column  phyrds         format  99999999999 heading "Reads"
+column  FILE_NAME          format           a60 heading "File"  
+column  phyblkrd       format  99999999999 heading "Blks_Rd"
+column  readtim        format  9999.999  heading "Avg_Time"
+column  phywrts        format  9999999 heading "Writes"
+column  phyblkwrt      format  9999999 heading "Blks_wrt"
+column  writetim       format  99.999  heading "Avg_Time"
+col sys_date new_value m_timestamp;
+--select to_char(sysdate,'yyyy_dd_mm_hh24_miss') sys_date from dual;
+--spool /tmp/filestat.&m_timestamp
+select 
+        f.file#,
+                d.FILE_NAME,
+        f.phyrds,
+        f.phyblkrd,
+        round(readtim/decode(f.phyrds,0,1,f.phyrds),3)    readtim,
+        f.phywrts,
+        f.phyblkwrt,
+        round(writetim/decode(f.phywrts,0,1,f.phywrts),3) writetim
+from v$filestat f, dba_data_files d
+where f.file# = d.FILE_ID and
+rownum < 5
+order by phyrds desc
+/
+--spool off
+
+Set Heading  on
+Set Feedback on
+Set Verify   on
+Set echo on
+
+
+--- sino va,por lento, lanzar este:
+SELECT file_name, phyrds, phywrts
+FROM gv$filestat g, dba_data_files f
+WHERE g.file# = f.file_id;
+
+
+@ratios -------------------------------------------------------------------------------------------------
+set echo off
+set feedback off
+set timing off
+set head off
+--set termout off
+set trimspool on 
+set verify off
+
+
+select 'Buffer Cache Hit Ratio(> 80%) = '|| round ((1 - (pr.value / (bg.value + cg.value))) * 100, 2)
+from v$sysstat pr, v$sysstat bg, v$sysstat cg
+where pr.name = 'physical reads'
+and bg.name = 'db block gets'
+and cg.name = 'consistent gets'
+/
+select 'Dictionary Cache Hit Ratio(> 90%) = '|| round (sum (gets - getmisses) * 100 / sum (gets), 2)
+from v$rowcache
+/
+select 'Sorts in Memory(high %) = '|| round ((mem.value / (mem.value + dsk.value)) * 100, 2)
+from v$sysstat mem, v$sysstat dsk
+where mem.name = 'sorts (memory)'
+and dsk.name = 'sorts (disk)'
+/
+select 'Shared Pool Free (%)= '|| round ((sum (decode (name, 'free memory', bytes, 0)) 
+/ sum (bytes)) * 100, 2)
+from v$sgastat
+/
+select 'Shared Pool Reloads (low %)= '|| round (sum (reloads) / sum (pins) * 100, 2)
+from v$librarycache
+where namespace in ('SQL AREA', 'TABLE/PROCEDURE', 'BODY', 'TRIGGER')
+/
+select 'Library Cache Get Hit Ratio (> 95%) = '|| round (sum (gethits) / sum (gets) * 100, 2)
+from v$librarycache
+/
+select 'Library Cache Pin Hit Ratio(> 99%) = '|| round (sum (pinhits) / sum (pins) * 100, 2)
+from v$librarycache
+/
+select 'Recursive Calls vs Total Calls (low) = '|| round ((rcv.value / (rcv.value + usr.value)) * 100, 2)
+from v$sysstat rcv, v$sysstat usr
+where rcv.name = 'recursive calls'
+and usr.name = 'user calls'
+/
+select 'Sort vs Total Table Scans (high)= '|| round ((shrt.value / (shrt.value + lng.value)) * 100, 2)
+from  v$sysstat shrt, v$sysstat lng
+where shrt.name = 'table scans (short tables)'
+and lng.name = 'table scans (long tables)'
+/
+select 'Redo Space Wait Ratio (very low)= '|| round ((req.value / wrt.value) * 100, 2)
+from v$sysstat req, v$sysstat wrt
+where req.name = 'redo log space requests'
+and wrt.name = 'redo writes'
+/
+select 'Redo Log Allocation Latch Contention(very low) = '|| round (greatest ((sum (decode (ln.name, 'redo allocation', 
+  misses, 0))
+/ greatest (sum (decode (ln.name, 'redo allocation', gets, 0)), 1)),
+(sum (decode (ln.name, 'redo allocation', immediate_misses, 0))
+/ greatest (sum (decode (ln.name, 'redo allocation', immediate_gets, 
+  0))
++ sum (decode (ln.name, 'redo allocation', immediate_misses, 0)), 1))
+) * 100, 2)
+from v$latch l, v$latchname ln
+where  l.latch# = ln.latch#
+/
+select 'Redo Log Copy Latch Contention(very Low) = '|| round (greatest ((sum (decode (ln.name, 'redo copy', misses, 0))
+/ greatest (sum (decode (ln.name, 'redo copy', gets, 0)), 1)),
+(sum (decode (ln.name, 'redo copy', immediate_misses, 0))
+/ greatest (sum (decode (ln.name, 'redo copy', immediate_gets, 0))
++ sum  (decode (ln.name, 'redo copy', immediate_misses, 0)), 1))
+) * 100, 2)
+from v$latch l, v$latchname ln
+where l.latch# = ln.latch#
+/
+select 'Chained Fetch Ratio(very low) = '|| round ((cont.value / (scn.value + rid.value)) * 100, 2)
+from v$sysstat cont, v$sysstat scn, v$sysstat rid
+where cont.name = 'table fetch continued row'
+and scn.name = 'table scan rows gotten'
+and rid.name = 'table fetch by rowid'
+/
+select 'Free List Contention(very low) = '|| round ((sum (decode (w.class, 'free list', count, 0)) 
+/ (sum (decode (name, 'db block gets', value, 0))
++ sum (decode (name, 'consistent gets', value, 0)))) * 100, 2)
+from v$waitstat w, v$sysstat
+/
+select 'CPU Parse Overhead(low) = '|| round ((prs.value / (prs.value + exe.value)) * 100, 2)
+from v$sysstat prs, v$sysstat exe
+where prs.name like 'parse count (hard)'
+and exe.name = 'execute count'
+/
+select 'Willing-to-Wait Latch Gets(high) = '|| round (((sum (gets) - sum(misses)) / sum (gets)) * 100, 2)
+from v$latch
+/
+select 'Immediate Latch Gets(high) = '|| round (((sum (immediate_gets) - sum (immediate_misses)) 
+/ sum (immediate_gets)) * 100, 2)
+from v$latch
+/
+
+set feedback on
+set timing on
+set head on
+--set termout off
+set trimspool off 
+set verify on
+set echo on
+
+
+@ses ---------------------------------------------------------------------------------------------------
+
+col sid format 999999
+col sidserial format a15
+col ses.sid||','||ses.serial# format a12
+col machine format a15
+col event format a15
+col wait_class format a12            
+col HORA_LOGIN format a20
+col client_identifier format a10
+col hora_ini format a10
+col H_LOGON format a10
+col texto format a30
+col status format a1
+col ET format 999999
+col ss_wait format 999999
+col program format a17
+col osuser format a12
+col ospid format a8
+col process format a8
+col I format 9
+col username format a15
+col module format a15
+col srv format a10
+--select 'alter system kill session '''||ses.sid||','||ses.serial#||',@'||ses.inst_id||''' immediate;'
+select ses.sid||','||ses.serial#||',@'||ses.inst_id as sidserial,
+   ses.inst_id I,
+   p.spid ospid, -- Esta SI
+   ses.process,  -- Esta SI
+   ses.username,
+                ses.machine,  -- Esta SI
+   ses.program, -- Esta SI
+   ses.osuser,
+--   ses.client_identifier, -- Esta SI
+--   ses.module,
+   ses.wait_class,
+   ses.event,
+   substr(ses.status,0,1) status, -- Esta SI
+   to_char(sysdate-(ses.last_call_et/24/60/60),'YYYY/MM/DD HH24:MI:SS') as hora_ini,
+   seconds_in_wait as ss_wait,
+   last_call_et ET,
+   to_char(logon_time,'YYYY/MM/DD HH24:MI:SS') H_LOGON,
+--       substr((select sql_text from gv$sql vsql where vsql.sql_id=ses.sql_id and vsql.inst_id = ses.inst_id and vsql.child_number = ses.sql_child_number and rownum = 1),0,150) texto, -- ESTA SI
+substr(sq.sql_text,0,150) texto, --ESTA SI
+service_name as srv, -- Esta SI
+ses.sql_id
+from gv$session ses 
+left outer join gv$sql sq on (ses.sql_id = sq.sql_id and sq.inst_id = ses.inst_id and sq.child_number = ses.sql_child_number and rownum=1) -- ESTA SI
+--  left outer join gv$process p on (p.addr = ses.paddr and p.inst_id = ses.inst_id)
+,gv$process p
+where p.addr = ses.paddr
+and p.inst_id = ses.inst_id
+--and ses.type <> 'BACKGROUND' -- Esta SI
+--and ses.sid||','||ses.serial#||',@'||ses.inst_id = '110,39813,@2'
+--and p.spid = '24791'
+--and (ses.status <> 'INACTIVE'
+--or ses.WAIT_CLASS <> 'Idle') -- Esta SI
+--and ses.username like '%REPCIBELES%'
+--and ses.sid  in (629)
+and (ses.WAIT_CLASS <> 'Idle' -- Esta SI
+-- or ses.PROGRAM like '%(J%'
+-- or ses.PROGRAM like '%(P%'
+-- or ses.PROGRAM like '%(DW%'
+or ses.STATUS='KILLED') -- Esta SI
+--and ses.client_identifier like '%26f'
+--and ses.sid in ('954')
+--and p.spid = 13973
+--and ses.sql_id = 'fc317sy20zy48'
+--and ses.program like 'rman%'
+order by last_call_et;
+
+
+@pxses ---------------------------------------------------------------------------------------------------
+
+-- Parallel Execution Information
+-- Extracted from Script to monitor parallel queries (Doc ID 457857.1)
+col username for a12 
+col "QC SID" for A6 
+col "SID" for A6 
+col "QC/Slave" for A8 
+col "Req. DOP" for 9999 
+col "Actual DOP" for 9999 
+col "Slaveset" for A8 
+col "Slave INST" for A9 
+col "QC INST" for A6 
+set pages 300 lines 300 
+col wait_event format a30 
+select 
+decode(px.qcinst_id,NULL,username,  
+' - '||lower(substr(pp.SERVER_NAME, 
+length(pp.SERVER_NAME)-4,4) ) )"Username", 
+decode(px.qcinst_id,NULL, 'QC', '(Slave)') "QC/Slave" , 
+to_char( px.server_set) "SlaveSet", 
+to_char(s.sid) "SID", 
+to_char(px.inst_id) "Slave INST", 
+decode(sw.state,'WAITING', 'WAIT', 'NOT WAIT' ) as STATE,      
+case  sw.state WHEN 'WAITING' THEN substr(sw.event,1,30) ELSE NULL end as wait_event , 
+decode(px.qcinst_id, NULL ,to_char(s.sid) ,px.qcsid) "QC SID", 
+to_char(px.qcinst_id) "QC INST", 
+px.req_degree "Req. DOP", 
+px.degree "Actual DOP" 
+from gv$px_session px, 
+gv$session s , 
+gv$px_process pp, 
+gv$session_wait sw 
+where px.sid=s.sid (+) 
+and px.serial#=s.serial#(+) 
+and px.inst_id = s.inst_id(+) 
+and px.sid = pp.sid (+) 
+and px.serial#=pp.serial#(+) 
+and sw.sid = s.sid   
+and sw.inst_id = s.inst_id    
+order by 
+  decode(px.QCINST_ID,  NULL, px.INST_ID,  px.QCINST_ID), 
+  px.QCSID, 
+  decode(px.SERVER_GROUP, NULL, 0, px.SERVER_GROUP),  
+  px.SERVER_SET,  
+  px.INST_ID 
+/ 
+
+
+@useract ---------------------------------------------------------------------------------------------------
+	set echo off
+	set heading on
+	set linesize 400
+	set long 5000
+	set pagesize 5000
+	column status format a10
+	col last_work_time format a8
+	set feedback off
+	set serveroutput on
+	set timing off
+
+	column username format a20
+	column sql_text format a200 word_wrapped
+
+
+
+	-- It shows you who's logged in and active -- and if 
+	--active, the statement they are executing (and the last et text shows you how long that 
+	--statement has been executing).  Currently, it shows only SQL that is executing right now, 
+	--just change the predicate from "where status = 'ACTIVE'" to "where status = status" if 
+	--you want to see the currently executing as well as LAST executed (in which case the last 
+	--et column text shows you how long they've been idle -- not how long that statement took 
+	--to execute):
+	-- fuente: http://asktom.oracle.com/pls/asktom/f?p=100:11%3A0%3A%3A%3A%3AP11_QUESTION_ID:497421739750
+	--
+	-- SQL that is executing right now
+	-- 
+
+
+	column status format a10
+	col last_work_time format a8
+	set feedback off
+	set serveroutput on
+	set timing off
+	set echo off
+
+	column username format a20
+	column sql_text format a200 word_wrapped
+
+
+	Ttitle  ' [ SQL runing -- v$session, v$process ]'  skip 2
+
+	set serveroutput on size 1000000
+	declare
+		x number;
+	begin
+		for x in
+		( select username||'('||sid||','||serial#||
+					') ospid = ' ||  process ||
+					' program = ' || program username,
+				 to_char(LOGON_TIME,' Day HH24:MI') logon_time,
+				 to_char(sysdate,' Day HH24:MI') current_time,
+				 sql_address, LAST_CALL_ET
+			from v$session
+		   --where status = 'ACTIVE'
+		   where status = status
+			 and rawtohex(sql_address) <> '00'
+			 and username is not null order by last_call_et )
+		loop
+			for y in ( select max(decode(piece,0,sql_text,null)) ||
+							  max(decode(piece,1,sql_text,null)) ||
+							  max(decode(piece,2,sql_text,null)) ||
+							  max(decode(piece,3,sql_text,null))
+								   sql_text
+						 from v$sqltext_with_newlines
+						where address = x.sql_address
+						  and piece < 4)
+			loop
+				if ( y.sql_text not like '%listener.get_cmd%' and
+					 y.sql_text not like '%RAWTOHEX(SQL_ADDRESS)%')
+				then
+					dbms_output.put_line( '--------------------' );
+					dbms_output.put_line( x.username );
+					dbms_output.put_line( x.logon_time || ' ' ||
+										  x.current_time||
+										  ' last et = ' ||
+										  x.LAST_CALL_ET);
+					dbms_output.put_line(
+							  substr( y.sql_text, 1, 250 ) );
+				end if;
+			end loop;
+		end loop;
+	end;
+	/
+
+	col TERMINAL format a8
+	col PROGRAM format a30
+
+	Ttitle  ' [ User Activity -- v$session, v$process ]'  skip 2
+	select
+	   substr(a.spid,1,9) pid,
+	   substr(b.username,1,10) username,
+	   substr(b.sid,1,5) sid,
+	   substr(b.serial#,1,5) ser#,
+	   substr(b.machine,1,20) box,
+	   substr(b.osuser,1,8) os_user,
+	   substr(b.program,1,30) program,
+	   b.logon_time,
+	   b.last_call_et "LAST (SEC)",
+	   to_char(sysdate-(b.last_call_et/(60*60*24)),'hh24:mi:ss') last_work_time
+	from 
+	   v$session b, 
+	   v$process a
+	where
+	b.paddr = a.addr
+	and b.program like 'pcoadmin%'
+	--and b.machine like '%LAPMA0N325%'
+	order by last_call_et
+	/
+
+
+	ttitle off
+	btitle off
+	set timing on
+	set feedback on
+	set echo off
+	set heading on
+	set linesize 450
+	set long 5000
+	set pagesize 5000
+	column status format a10
+	col last_work_time format a8
+	set feedback off
+	set serveroutput on
+	set timing off
+
+	column username format a20
+	column sql_text format a200 word_wrapped
+
+
+
+	-- It shows you who's logged in and active -- and if 
+	--active, the statement they are executing (and the last et text shows you how long that 
+	--statement has been executing).  Currently, it shows only SQL that is executing right now, 
+	--just change the predicate from "where status = 'ACTIVE'" to "where status = status" if 
+	--you want to see the currently executing as well as LAST executed (in which case the last 
+	--et column text shows you how long they've been idle -- not how long that statement took 
+	--to execute):
+	-- fuente: http://asktom.oracle.com/pls/asktom/f?p=100:11%3A0%3A%3A%3A%3AP11_QUESTION_ID:497421739750
+	--
+	-- SQL that is executing right now
+	-- 
+
+
+	column status format a10
+	col last_work_time format a8
+	set feedback off
+	set serveroutput on
+	set timing off
+	set echo off
+
+	column username format a20
+	column sql_text format a200 word_wrapped
+
+
+	Ttitle  ' [ SQL runing -- v$session, v$process ]'  skip 2
+
+	set serveroutput on size 1000000
+	declare
+		x number;
+	begin
+		for x in
+		( select username||'('||sid||','||serial#||
+					') ospid = ' ||  process ||
+					' program = ' || program username,
+				 to_char(LOGON_TIME,' Day HH24:MI') logon_time,
+				 to_char(sysdate,' Day HH24:MI') current_time,
+				 sql_address, LAST_CALL_ET
+			from v$session
+		   --where status = 'ACTIVE'
+		   where status = status
+			 and rawtohex(sql_address) <> '00'
+			 and username is not null order by last_call_et )
+		loop
+			for y in ( select max(decode(piece,0,sql_text,null)) ||
+							  max(decode(piece,1,sql_text,null)) ||
+							  max(decode(piece,2,sql_text,null)) ||
+							  max(decode(piece,3,sql_text,null))
+								   sql_text
+						 from v$sqltext_with_newlines
+						where address = x.sql_address
+						  and piece < 4)
+			loop
+				if ( y.sql_text not like '%listener.get_cmd%' and
+					 y.sql_text not like '%RAWTOHEX(SQL_ADDRESS)%')
+				then
+					dbms_output.put_line( '--------------------' );
+					dbms_output.put_line( x.username );
+					dbms_output.put_line( x.logon_time || ' ' ||
+										  x.current_time||
+										  ' last et = ' ||
+										  x.LAST_CALL_ET);
+					dbms_output.put_line(
+							  substr( y.sql_text, 1, 250 ) );
+				end if;
+			end loop;
+		end loop;
+	end;
+	/
+
+	col TERMINAL format a8
+	col PROGRAM format a30
+
+	Ttitle  ' [ User Activity -- v$session, v$process ]'  skip 2
+	select
+	   substr(a.spid,1,9) pid,
+	   substr(b.username,1,20) username,
+	   substr(b.sid,1,5) sid,
+	   substr(b.serial#,1,5) ser#,
+	   substr(b.machine,1,20) box,
+	   substr(b.osuser,1,8) os_user,
+	   substr(b.program,1,30) program,
+	   b.logon_time,
+	   b.last_call_et "LAST (SEC)",
+	   to_char(sysdate-(b.last_call_et/(60*60*24)),'hh24:mi:ss') last_work_time
+	from 
+	   v$session b, 
+	   v$process a
+	where
+	b.paddr = a.addr
+	--and type='USER'
+	order by last_call_et
+	/
+
+
+	ttitle off
+	btitle off
+	set timing on
+	set feedback on
+	set echo on
+	
+	
+
+
+--------------------------------------------------------
+resumen: useract2
+
+
+set linesize 400
+set pagesize 9000
+
+SELECT MACHINE, PROGRAM, COUNT(*) FROM gV$SESSION 
+HAVING COUNT(*) > 1
+GROUP BY MACHINE, PROGRAM ORDER BY 1,2;
+
+select count(*) FROM V$SESSION HAVING COUNT(*) > 1;
+
+sessiones RAC:
+SELECT s.inst_id,
+       s.sid,
+       s.serial#,
+	   s.machine,
+       p.spid,
+       s.username,
+       s.program
+FROM   gv$session s
+       JOIN gv$process p ON p.addr = s.paddr AND p.inst_id = s.inst_id
+WHERE  s.type != 'BACKGROUND';
+
+
+@verasm -----------------------------------------------------------------------------------------------------------
+
+set echo off
+
+prompt
+prompt .: ASM
+prompt
+
+-- ASM - Automatic Storage Management - ASM - volume manager
+-- ASM SPACE USAGE BY FILETYPE
+set term on
+
+SET pages 32767 
+SET lines 255 
+SET numf 999,999
+
+COLUMN NAME HEAD "DiskGroup" FORMAT A15
+COLUMN type HEAD "FileType" FORMAT A20
+COLUMN SizeGB HEAD "Size|(GB)"
+
+TTITLE LEFT "ASM SPACE USAGE BY FILETYPE" 
+
+BREAK ON REPORT 
+BREAK ON NAME
+COMPUTE SUM LABEL 'Total' OF SizeGB FORMAT 99,999,999 ON NAME
+COMPUTE SUM LABEL 'Total' OF SizeGB FORMAT 99,999,999 ON REPORT 
+
+select dg.name
+, f.type
+, ROUND(sum(bytes)/1024/1024/1024) SizeGB
+from v$asm_file f
+, v$asm_diskgroup dg
+where dg.group_number = f.group_number
+group by dg.name, f.type 
+ORDER BY dg.name, f.type ;
+
+
+-- TAMAÑOS: size, Tmaño total, tamaño libre
+select GROUP_NUMBER, name, state, type, total_mb/1024 TOTAL_GB, free_mb  from v$asm_diskgroup;
+--por disco:
+col NAME format a13
+col PATH format a15
+select GROUP_NUMBER,NAME, total_mb/1024 TOTAL_GB,FREE_MB,PATH
+from v$asm_disk;
+
+SELECT * FROM V$FLASH_RECOVERY_AREA_USAGE;
+
+set lines 100
+col name format a60
+select	name
+,	floor(space_limit / 1024 / 1024) "Size MB"
+,	ceil(space_used  / 1024 / 1024) "Used MB"
+from	v$recovery_file_dest
+order by name
+/
+
+-- Ver los que hay en la flash
+select sequence#,name,is_recovery_dest_file from V$ARCHIVED_LOG
+where name != 'NULL'
+order by sequence# desc;
+
+
+--ASM DISKGROUPS
+SELECT group_number, name, state, total_mb, free_mb, ROUND(free_mb/1024,2) free_gb, block_size, allocation_unit_size, type
+FROM v$asm_diskgroup;
+
+--ASM DISKS
+COL path FORMAT a50
+SELECT group_number, disk_number,  mount_status, header_status, mode_status, state, redundancy, total_mb, free_mb, name, path, create_date, mount_date
+FROM v$asm_disk;
+
+SELECT group_number, name, disk_number, FAILGROUP,PREFERRED_READ, mount_status, redundancy, total_mb, free_mb, path,  mount_date
+FROM v$asm_disk;
+
+--ASM FILES
+SELECT group_number, file_number, block_size, blocks, ROUND((bytes/1024/1024),2) mb, space, type, redundancy, creation_date, modification_date
+FROM v$asm_file;
+
+--ASM OPERATIONS
+SELECT group_number, operation, state, power, actual, ROUND(100*sofar/DECODE(est_work,0,1,est_work),2) avance, est_rate, est_minutes
+FROM v$asm_operation;	
+
+-- TODOS LOS FICHEROS (NOTA: RELLENA USUARIO)
+column full_alias_path format a70
+column file_type format a15
+set pages 8000 lines 350 
+
+select concat('+'||gname, sys_connect_by_path(aname, '/')) full_alias_path, 
+       system_created, alias_directory, file_type, mb
+from ( select b.name gname, a.parent_index pindex, a.name aname, 
+              a.reference_index rindex , a.system_created, a.alias_directory,
+			  ROUND((c.bytes/1024/1024),2) mb,
+              c.type file_type
+       from v$asm_alias a, v$asm_diskgroup b, v$asm_file c
+       where a.group_number = b.group_number
+             and a.group_number = c.group_number(+)
+             and a.file_number = c.file_number(+)
+             and a.file_incarnation = c.incarnation(+)
+     )
+start with (mod(pindex, power(2, 24))) = 0
+            and rindex in 
+                ( select a.reference_index
+                  from v$asm_alias a, v$asm_diskgroup b
+                  where a.group_number = b.group_number
+                        and (mod(a.parent_index, power(2, 24))) = 0
+                        and a.name = 'LOGTECA'
+                )
+connect by prior rindex = pindex
+order by 5 DESC;
+
+TTITLE OFF
+set echo on
+
+
+
+
+
+@versql -----------------------------------------------------------------------------------------------------------
+
+set wrap on
+set long 60000
+set verify off
+set pagesize 9000
+set lines 130
+column sql_text heading "Texto SQL" format a80 word
+column Programa format a20 word
+col sid format 999
+col Veces format 9999
+col username format a10
+
+alter session set nls_date_format='DDMMYYYY HH24:MI:SS';
+prompt
+prompt
+
+select 
+                s.sid,s.username,
+                substr(s.program,instr(replace(s.program,'\',']'),']',-1)+1) Programa,
+                t.last_load_time,
+                t.last_active_time,
+                t.sql_fulltext,
+				t.old_hash_value
+from 
+                v$sqlarea t, 
+                v$session s
+where 
+                    s.sql_address = t.address 
+                and s.sql_hash_value = t.hash_value
+                and s.sid = &1
+/
+
+-------------------------------- Vers 9
+set wrap on
+set long 70000
+set verify off
+set pagesize 80000
+set lines 130
+column sql_text heading "Texto SQL" format a80 word
+column Programa format a20 word
+col sid format 999
+col Veces format 9999
+col username format a10
+
+alter session set nls_date_format='DDMMYYYY HH24:MI:SS';
+prompt
+prompt
+
+select 
+                s.sid,s.username,
+                substr(s.program,instr(replace(s.program,'\',']'),']',-1)+1) Programa,
+                t.sql_text
+from 
+                v$sqlarea t, 
+                v$session s
+where 
+                    s.sql_address = t.address 
+                and s.sql_hash_value = t.hash_value
+                and s.sid = &1
+/
+
+
+******* que hace la sql???
+
+a) explain plan for
+[query]
+
+b) @?/rdbms/admin/utlxpls.sql
+
+
+----
+OLD:
+select sql_text,users_executing from v$sql where hash_value =(select sql_hash_value from v$session where sid=&sid);
+undef  sid
+
+set long 90000
+select sql_text,users_executing from v$sql where hash_value =(select sql_hash_value from v$session where sid=115);
+
+select sql_text,users_executing from v$sql where hash_value =(select sql_hash_value from v$session where sid=179);
+
+luego para ver el explainplan:
+SET AUTOTRACE TRACEONLY EXP y ejecutar el select
+
+
+
+@sqlarea ------------------------------------------------------------------------------------------------
+set echo off
+Set Heading  On
+set timing off
+Set Feedback Off
+Set Verify   Off
+
+rem
+rem     Script:        sqlarea.sql
+rem     Author:        J.P.Lewis
+rem     Dated:         Many moons ago
+rem     Purpose:       Dump stats and text of recent expensive SQL
+rem
+rem     Notes:
+rem     m_timestamp has been defined when this script is called
+rem
+rem     You can adjust the constants in the WHERE clause to suit your
+rem     definition of what is expensive on your system.
+rem
+rem     The script tries to highlight code on the basis of absolute cost,
+rem     and on cost per execution.  
+rem
+rem     Spot the little trick for avoiding divide by zero errors.  This
+rem     can crop up very easily, especially if someone does an:
+rem            alter system flush shared pool;
+rem     The SQL can stay in the pool but with the set back to zero.
+rem
+set pagesize 999
+set trimspool on
+clear columns
+clear breaks
+column  sql_text format a78 word_wrapped
+column  memory         noprint new_value m_memory
+column  sorts          noprint new_value m_sorts
+column  executions     noprint new_value m_executions
+column  first_load_time noprint new_value m_first_load_time
+column  invalidations  noprint new_value m_invalidations
+column  parse_calls    noprint new_value m_parse_calls
+column  disk_reads     noprint new_value m_disk_reads
+column  buffer_gets    noprint new_value m_buffer_gets
+column  rows_processed noprint new_value m_rows_processed
+column  row_ratio      noprint new_value m_row_ratio
+column  disk_ratio     noprint new_value m_disk_ratio
+column  buffer_ratio   noprint new_value m_buffer_ratio
+break on row skip page
+set heading off
+col sys_date new_value m_timestamp;
+select CONCAT('/tmp/sqlarea.',to_char(sysdate,'yyyy_dd_mm_hh24_miss')) "Fichero Dump de SQL Area" from dual;
+spool /tmp/sqlarea.&m_timestamp 
+
+
+ttitle  -
+        "First load time: " m_first_load_time -
+        skip 1 -
+        "Buffer gets:     " m_buffer_gets " ratio " m_buffer_ratio -
+        skip 1 -
+        "Disk reads:      " m_disk_reads  " ratio " m_disk_ratio -
+        skip 1 -
+        "Rows delivered   " m_rows_processed " ratio " m_row_ratio -
+        skip 1 -
+        "Executions       " m_executions -
+        skip 1 -
+        "Parses           " m_parse_calls -
+        skip 1 -
+        "Memory           " m_memory -
+        skip 1 -
+        "Sorts            " m_sorts -
+        skip 1 -
+        "Invalidations    " m_invalidations -
+        skip 2
+
+set termout off
+select 
+        sql_text,
+        sharable_mem + persistent_mem + runtime_mem memory,
+        sorts,
+        executions,
+        first_load_time,
+        invalidations,
+        parse_calls,
+        disk_reads,
+        buffer_gets,
+        rows_processed,
+        round(rows_processed/greatest(executions,1))  row_ratio,
+        round(disk_reads/greatest(executions,1))      disk_ratio,
+        round(buffer_gets/greatest(executions,1))     buffer_ratio
+from v$sqlarea
+where
+        executions > 100
+or      disk_reads > 1000
+or      buffer_gets > 1000
+or      rows_processed > 1000
+order by
+        executions * 250 + disk_reads * 25 + buffer_gets desc
+;
+spool off
+ttitle off
+
+set trimspool off
+Set Heading  On
+Set Feedback On
+set timing on
+Set Verify   On
+set termout on
+
+
+@topcpu --------------------------------------------------------------------------------------------------------------
+ttitle off
+btitle off
+
+set timing off
+set feedback off
+set heading on
+
+
+col name     format a30
+col username format a15
+col osuser   format a15
+col machine  format a12
+set lines 132
+set pages 1000
+
+break on sid skip 1
+
+select * from (
+select a.sid
+,      c.username
+,      c.osuser
+,      c.machine
+,      b.name 
+,      a.value
+from   v$sesstat  a
+,      v$statname b
+,      v$session  c
+where a.STATISTIC# = b.STATISTIC#
+and   a.sid = c.sid
+and   b.name like '%CPU%'
+order by a.value desc)
+where rownum < 11
+/
+
+set heading off
+set timing on
+
+@tps --------------------------------------------------------------------------------------------------------------
+
+prompt
+prompt  DB TPS (Transactions/s) -- dba_hist_sysstat
+prompt
+
+
+prompt low 10-100,Med 100-1000, high 1k -10k
+WITH hist_snaps
+AS (SELECT instance_number, snap_id, round(begin_interval_time,'MI') datetime, (begin_interval_time + 0 - LAG (begin_interval_time + 0) OVER (PARTITION BY dbid, instance_number ORDER BY snap_id)) * 86400 diff_time FROM dba_hist_snapshot), hist_stats
+AS (SELECT dbid,
+instance_number,
+snap_id,
+stat_name,
+VALUE - LAG (VALUE) OVER (PARTITION BY dbid,instance_number,stat_name ORDER BY snap_id)
+delta_value
+FROM dba_hist_sysstat
+WHERE stat_name IN ('user commits', 'user rollbacks'))
+SELECT datetime,
+ROUND (SUM (delta_value) / 3600, 2) "Transactions/s"
+FROM hist_snaps sn, hist_stats st
+WHERE st.instance_number = sn.instance_number
+AND st.snap_id = sn.snap_id
+AND diff_time IS NOT NULL
+GROUP BY datetime
+ORDER BY 1 desc;
+
+
+@vermem --------------------------------------------------------------------------------------------------------------------
+set echo off
+set timing off
+set pagesize 1000
+set feedback off
+
+
+prompt
+prompt  MEMORIA - @vermem
+prompt
+set heading off
+col NAME||':' format a21
+column name  format a20
+col value format a12
+prompt
+prompt  Memory Summary
+prompt
+select name ||': ',value/1024/1024 "SIZE MB"
+from v$parameter
+where name in ('sga_max_size','pga_aggregate_target','db_cache_size','shared_pool_size','large_pool_size','log_buffer','java_pool_size','sort_area_size')
+/
+set heading on
+select round((sum(decode(name,'free memory',bytes,0))/sum(bytes))*100,2) "% Free SharedPool" from v$sgastat
+/
+select name,pool, bytes/1024/1024 "SIZE MB"
+from v$sgastat 
+where name = 'free memory'
+union all
+select name,pool, bytes/1024/1024 "SIZE MB"
+from v$sgastat 
+where name in  ('library cache','row cache','sql area','dictionary cache')
+/
+select name, bytes/1024/1024 "SIZE MB"
+from v$sgainfo 
+where name in ('Shared Pool Size','Large Pool Size','Java Pool Size')
+/
+set pagesize 132
+
+column owner format a16
+column name  format a36
+column sharable_mem format 999,999,999
+column executions   format 999,999,999
+prompt
+prompt  Top10 Memory Usage of Shared Pool Order - Biggest First
+prompt
+column name format a45
+select  owner, name||' - '||type name, sharable_mem from v$db_object_cache
+where sharable_mem > 10000
+  and type in ('PACKAGE', 'PACKAGE BODY', 'FUNCTION', 'PROCEDURE')
+  and rownum < 11
+order by sharable_mem desc
+/
+prompt
+prompt  Loads into Shared Pool  - Most Loads First
+prompt
+select  owner, name||' - '||type name, loads , sharable_mem from v$db_object_cache
+where loads > 3
+  and type in ('PACKAGE', 'PACKAGE BODY', 'FUNCTION', 'PROCEDURE')
+order by loads desc
+/
+prompt
+prompt  Executions of Objects in the  Shared Pool  - Most Executions First
+prompt
+select  owner, name||' - '||type name, executions from v$db_object_cache
+where executions  > 100
+  and type in ('PACKAGE', 'PACKAGE BODY', 'FUNCTION', 'PROCEDURE')
+order by executions  desc
+/
+
+set echo on
+
+
+
+@verjobs -----------------------------------------------------------------------------------------------------
+
+set pagesize 5000
+set linesize 450
+alter session set nls_date_format='DDMMYYYY HH24:MI:SS';
+
+prompt
+prompt  JOBS RUNING:
+prompt
+
+SELECT job,
+sid id,
+failures fallas,
+Substr(To_Char(last_date,'DD-Mon-YYYY HH24:MI:SS'),1,20) ultimaFecha,
+Substr(To_Char(this_date,'DD-Mon-YYYY HH24:MI:SS'),1,20) EstaFecha
+FROM dba_jobs_running;
+
+prompt
+prompt  Listado JOBS:
+prompt	 
+
+
+set pages 1000
+set lines 120
+set linesize 450
+set pagesize 5000
+col job format 99999
+col interval format a25
+col what format a65
+select job,LAST_DATE,INTERVAL,SCHEMA_USER,BROKEN,NEXT_DATE,TOTAL_TIME,WHAT
+from dba_jobs
+order by 3;
+
+
+@verun --------------------------------------------------------------------------------------------------------- 
+
+set pagesize 9000
+
+
+select 
+a.sid, 
+a.serial# sid, 
+a.username, 
+a.machine, 
+a.program, 
+a.status, 
+b.event, 
+b.seconds_in_wait 
+from v$session a, 
+v$session_wait b 
+where b.sid = a.sid 
+and a.username is not null 
+and status = 'ACTIVE' 
+order by b.seconds_in_wait;
+
+@locks ---------------------------------------------------------------------------------------------------------
+
+set pagesize 9000
+set linesize 450
+
+Ttitle  ' [ Who is holding locks for more than one minute - V_$LOCKED_OBJECT ALL_OBJECTS V_$SESSION ]'  skip 2
+col sid format 999
+col locker format a10
+col OBJECT_NAME format a20
+col LOCKED_MODE format a20 
+select Lpad(session_id,5) "sid",SERIAL#  "Serial",substr(OBJECT_NAME,1,20) "Object",
+Lpad(substr(ORACLE_USERNAME,1,10),10) "Locker",NVL(lockwait,'ACTIVE') "Wait",DECODE(LOCKED_MODE,
+    2, 'ROW SHARE',
+    3, 'ROW EXCLUSIVE',
+    4, 'SHARE',
+    5, 'SHARE ROW EXCLUSIVE',
+    6, 'EXCLUSIVE',  'UNKNOWN') "Lockmode",
+  OBJECT_TYPE "Type"
+FROM SYS.V_$LOCKED_OBJECT A,SYS.ALL_OBJECTS B,SYS.V_$SESSION c
+WHERE A.OBJECT_ID = B.OBJECT_ID AND C.SID = A.SESSION_ID ORDER BY 1 asc, 5 desc;
+
+Ttitle  ' [ Quien Bloquea a Quien]'  skip 2
+select s1.username || '@' || s1.machine
+|| ' ( SID=' || s1.sid || ' ) is blocking '
+|| s2.username || '@' || s2.machine || ' ( SID=' || s2.sid || ' ) ' AS blocking_status
+from v$lock l1, v$session s1, v$lock l2, v$session s2
+where s1.sid=l1.sid and s2.sid=l2.sid
+and l1.BLOCK=1 and l2.request > 0
+and l1.id1 = l2.id1
+and l2.id2 = l2.id2
+/
+
+Ttitle  ' [ Eliminando Sesiones Bloqueantes ]'  skip 2
+-- Si queremos eliminar sessiones bloqueantes - killing block session - kill block ses
+
+select  'alter system kill session ''' ||session_id||','||SERIAL#||''';' from SYS.V_$LOCKED_OBJECT A,SYS.ALL_OBJECTS B,SYS.V_$SESSION c
+where A.OBJECT_ID = B.OBJECT_ID AND C.SID = A.SESSION_ID;
+
+
+Ttitle  ' [ Bloqueos de diccionario ]'  skip 2
+
+select /*+ ordered */ w1.sid waiting_session, h1.sid holding_session, 
+w.kgllktype lock_or_pin, 
+w.kgllkhdl address, 
+decode(h.kgllkmod, 0, 'None', 1, 'Null', 2, 'Share', 3, 'Exclusive', 
+'Unknown') mode_held,
+decode(w.kgllkreq, 0, 'None', 1, 'Null', 2, 'Share', 3, 'Exclusive', 
+'Unknown') mode_requested 
+from dba_kgllock w, dba_kgllock h, v$session w1, v$session h1 where 
+(
+(
+(h.kgllkmod != 0)
+and (h.kgllkmod != 1) 
+and ((h.kgllkreq = 0) or (h.kgllkreq = 1)) ) 
+and 
+(
+(
+(w.kgllkmod = 0)
+or (w.kgllkmod= 1) 
+) 
+and ( 
+( 
+w.kgllkreq != 0) 
+and (w.kgllkreq != 1) 
+)
+)
+)
+and w.kgllktype = h.kgllktype
+and w.kgllkhdl = h.kgllkhdl
+and w.kgllkuse = w1.saddr 
+and h.kgllkuse = h1.saddr;
+
+
+Ttitle  ' [ Bloqueos RAC ]'  skip 2
+col sidserial format a15
+col HORA_LOGIN format a20
+col client_identifier format a10
+col hora_ini format a10
+col h_logon format a10
+col texto format a30
+col ET format 999999
+col ss_wait format 999999
+col I format 9
+col bi format 9
+col bs format 999999
+col username format a15
+col module format a15
+col machine format a15
+col srv format a10
+col EVENT format a25
+col OSUSER format a10
+--select 'alter system kill session '''||ses.sid||','||ses.serial#||''' immediate;'
+select ses.sid||','||ses.serial#||',@'||ses.inst_id as sidserial,
+--       '@'||ses.inst_id I,
+--       p.spid ospid,
+--       ses.process,
+       ses.username,
+       ses.machine,
+       -- ses.module, -- Esta NO
+--       ses.program, -- Esta SI
+       substr(ses.status,0,1) status, -- Esta SI
+       ses.osuser,
+       ses.client_identifier, -- Esta SI
+--       ses.wait_class, --Esta SI
+       ses.event,
+        blocking_instance bi,
+        blocking_session bs,
+        to_char(ses.logon_time,'YYYY/MM/DD HH24:MI:SS') as h_logon,
+       to_char(sysdate-(ses.last_call_et/24/60/60),'YYYY/MM/DD HH24:MI:SS') as hora_ini,
+--       seconds_in_wait as ss_wait,
+       last_call_et ET,
+--       substr((select sql_text from gv$sql vsql where vsql.sql_id=ses.sql_id and rownum = 1),0,150) texto,
+--        substr(sq.sql_text,0,150) texto, -- ESTA SI
+--        service_name as srv,
+        ses.sql_id
+  from gv$session ses
+--  left outer join gv$sql sq on (ses.sql_id = sq.sql_id and sq.inst_id = ses.inst_id and sq.child_number = ses.sql_child_number)
+  ,gv$process p
+  where p.addr = ses.paddr
+  and p.inst_id = ses.inst_id
+  -- and p.spid = 25875
+   and ses.type <> 'BACKGROUND'
+   --and event like '%enq: TX - row lock conten%'
+  -- and ses.WAIT_CLASS <> 'Idle' -- Esta SI
+  -- and ses.program like '%PMON%'
+  -- and ses.machine like '%ad0apps113%'
+  --and ses.inst_id = 2
+  --and ses.username like ('MONITOR%')
+  --and sid in (1446)
+--  and ses.sql_id = 'a7bcu0ug7qrkk'
+  --and wait_class <> 'Cluster'
+--  and ses.status = 'INACTIVE' -- Esta SI
+  and (ses.inst_id||','||ses.sid in (select blocking_instance||','||blocking_session
+          from gv$session
+          where blocking_session is not null)
+  or blocking_session is not null)
+order by last_call_et;
+
+Ttitle  ' [ Bloqueos RAC  - kills ]'  skip 2
+select 'alter system kill session '''||ses.sid||','||ses.serial#||''' immediate;'
+  from gv$session ses
+  ,gv$process p
+  where p.addr = ses.paddr
+  and p.inst_id = ses.inst_id
+  -- and p.spid = 25875
+   and ses.type <> 'BACKGROUND'
+   --and event like '%enq: TX - row lock conten%'
+  -- and ses.WAIT_CLASS <> 'Idle' -- Esta SI
+  -- and ses.program like '%PMON%'
+  -- and ses.machine like '%ad0apps113%'
+  --and ses.inst_id = 2
+  --and ses.username like ('MONITOR%')
+  --and sid in (1446)
+--  and ses.sql_id = 'a7bcu0ug7qrkk'
+  --and wait_class <> 'Cluster'
+--  and ses.status = 'INACTIVE' -- Esta SI
+  and (ses.inst_id||','||ses.sid in (select blocking_instance||','||blocking_session
+          from gv$session
+          where blocking_session is not null)
+  or blocking_session is not null)
+order by last_call_et;
+
+
+
+@redogen ---------------------------------------------------------------------------------------------------------
+set timing off
+
+	-- ----------------------------------------------------------------------- ---
+	--   Log Info & Switch
+	-- ----------------------------------------------------------------------- ---
+	set heading on
+	set echo off
+	set linesize 150
+	set pagesize 500
+	column day format a16  heading 'Day'
+	column d_0 format a3  heading '00'
+	column d_1 format a3  heading '01'
+	column d_2 format a3  heading '02'
+	column d_3 format a3  heading '03'
+	column d_4 format a3  heading '04'
+	column d_5 format a3  heading '05'
+	column d_6 format a3  heading '06'
+	column d_7 format a3  heading '07'
+	column d_8 format a3  heading '08'
+	column d_9 format a3  heading '09'
+	column d_10 format a3  heading '10'
+	column d_11 format a3  heading '11'
+	column d_12 format a3  heading '12'
+	column d_13 format a3  heading '13'
+	column d_14 format a3  heading '14'
+	column d_15 format a3  heading '15'
+	column d_16 format a3  heading '16'
+	column d_17 format a3  heading '17'
+	column d_18 format a3  heading '18'
+	column d_19 format a3  heading '19'
+	column d_20 format a3  heading '20'
+	column d_21 format a3  heading '21'
+	column d_22 format a3  heading '22'
+	column d_23 format a3  heading '23'
+	column  Total   format 9999
+	column status  format a8
+	column member  format a70
+	column archived heading 'Archived' format a8
+	column bytes heading 'Bytes|(MB)' format 9999
+
+	Ttitle  ' [ Log Info ]'  skip 1
+	select l.group#,f.member,l.archived,l.bytes/1078576 bytes,l.status,f.type
+	  from v$log l, v$logfile f
+	 where l.group# = f.group#
+	/
+	Ttitle off
+
+	Ttitle  ' [ Log Switch ]'  skip 2
+	SELECT to_char(first_time,'DY, DD-MON-YYYY') Day,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'00',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'00',1
+	,0))) d_0,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'01',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'01',1
+	,0))) d_1,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'02',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'02',1
+	,0))) d_2,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'03',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'03',1
+	,0))) d_3,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'04',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'04',1
+	,0))) d_4,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'05',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'05',1
+	,0))) d_5,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'06',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'06',1
+	,0))) d_6,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'07',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'07',1
+	,0))) d_7,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'08',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'08',1
+	,0))) d_8,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'09',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'09',1
+	,0))) d_9,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'10',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'10',1
+	,0))) d_10,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'11',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'11',1
+	,0))) d_11,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'12',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'12',1
+	,0))) d_12,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'13',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'13',1
+	,0))) d_13,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'14',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'14',1
+	,0))) d_14,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'15',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'15',1
+	,0))) d_15,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'16',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'16',1
+	,0))) d_16,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'17',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'17',1
+	,0))) d_17,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'18',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'18',1
+	,0))) d_18,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'19',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'19',1
+	,0))) d_19,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'20',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'20',1
+	,0))) d_20,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'21',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'21',1
+	,0))) d_21,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'22',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'22',1
+	,0))) d_22,
+	  decode(sum(decode(substr(to_char(first_time,'HH24'),1,2),'23',1,0)),0,'-',sum(decode(substr(to_char(first_time,'HH24'),1,2),'23',1
+	,0))) d_23,
+	  count(trunc(first_time)) Total
+	 FROM v$log_history
+	 GROUP BY to_char(first_time,'DY, DD-MON-YYYY')
+	 ORDER BY to_date(substr(to_char(first_time,'DY, DD-MON-YYYY'),5,15) )
+	/
+	Ttitle off
+
+--------
+ * ASM:
+--------
+-- TAMAÑOS: size, Tmaño total, tamaño libre
+select GROUP_NUMBER, name, state, type, total_mb/1024 TOTAL_GB, free_mb  from v$asm_diskgroup;
+--por disco:
+col NAME format a13
+col PATH format a15
+select GROUP_NUMBER,NAME, total_mb/1024 TOTAL_GB,FREE_MB,PATH
+from v$asm_disk;
+
+
+SELECT * FROM V$FLASH_RECOVERY_AREA_USAGE;
+
+set lines 100
+col name format a60
+select	name
+,	floor(space_limit / 1024 / 1024) "Size MB"
+,	ceil(space_used  / 1024 / 1024) "Used MB"
+from	v$recovery_file_dest
+order by name
+/
+
+
+set linesize 350
+set pagesize 5000
+col GROUP_NUMBER            format 999999          heading "GROUP|NUMBER"
+col NAME format a8
+col PATH format a15
+select GROUP_NUMBER,NAME, MODE_STATUS,state,VOTING_FILE,MOUNT_DATE,CREATE_DATE,MOUNT_STATUS, total_mb/1024 TOTAL_GB,FREE_MB,PATH from v$asm_disk;
+
+@versqls ----------------------------------------------------------------------------------------------------------------------------
+
+--set lines 125 pages 50000 long 200000000
+
+set verify off lines 140 head on pagesize 300
+
+column sql_text format a65
+column username format a12
+column osuser format a15
+
+break on username on sid on osuser on status on spid
+
+select S.USERNAME, s.sid,p.spid, s.osuser,s.status, sql_text
+from v$sqltext_with_newlines t,V$SESSION s, v$process p
+where t.address =s.sql_address
+and t.hash_value = s.sql_hash_value 
+and s.paddr = p.addr
+order by s.sid,t.piece
+/
+
+
+@verhwm -----------------------------------------------------------------------------------------------------------------------------
+
+EM -- tablas a compactar?
+set lin 450 pages 900
+
+select * from (
+select owner,tablespace_name, table_name, NUM_ROWS,(blocks*8/1024)+ROUND((AVG_ROW_LEN * NUM_ROWS / (1024 * 1024)), 2) TOTAL, blocks*8/1024 Reserved_MB,  ROUND((AVG_ROW_LEN * NUM_ROWS / (1024 * 1024)), 2) Consumed_MB,
+((blocks*8/1024)*100)/((blocks*8/1024)+ROUND((AVG_ROW_LEN * NUM_ROWS / (1024 * 1024)), 2)) RESERV
+from all_tables 
+where NUM_ROWS > 1
+and owner not in ('SYSMAN','SYSTEM','WMSYS','SYS','PERFSTAT','SCOTT','XDB','ORDDATA','ORDDATA','ORDDATA','APEX_030200','CTXSYS','DBSNMP','EXFSYS','MDSYS','OLAPSYS','ORDSYS') 
+) where RESERV > 80 and Consumed_MB > 0
+order by 1,2,4,6 desc;
+
+
+REM -- Que se puede reducir ? - watermark - compactacion
+
+set verify off
+column file_name format a50 word_wrapped
+column smallest format 999,990 heading "Smallest|Size|Poss."
+column currsize format 999,990 heading "Current|Size"
+column savings  format 999,990 heading "Poss.|Savings"
+break on report
+compute sum of savings on report
+
+column value new_val blksize
+select value from v$parameter where name = 'db_block_size'
+/
+
+select a.file_id, file_name,
+       ceil( (nvl(hwm,1)*&&blksize)/1024/1024 ) smallest,
+       ceil( blocks*&&blksize/1024/1024) currsize,
+       ceil( blocks*&&blksize/1024/1024) -
+       ceil( (nvl(hwm,1)*&&blksize)/1024/1024 ) savings
+from dba_data_files a,
+     ( select file_id, max(block_id+blocks-1) hwm
+         from dba_extents
+        group by file_id ) b
+where a.file_id = b.file_id(+)
+/
+
+column cmd format a75 word_wrapped
+
+select 'alter database datafile ''' || file_name || ''' resize ' ||
+       ceil( (nvl(hwm,1)*&&blksize)/1024/1024 )  || 'm;' cmd
+from dba_data_files a,
+     ( select file_id, max(block_id+blocks-1) hwm
+         from dba_extents
+        group by file_id ) b
+where a.file_id = b.file_id(+)
+  and ceil( blocks*&&blksize/1024/1024) -
+      ceil( (nvl(hwm,1)*&&blksize)/1024/1024 ) > 0
+/ 
+
+
+
+
+@versorts ---------------------------------------------------------------------------------------------------------------------------
+
+set echo off
+
+prompt
+prompt  Number of memory SORTS and disk SORTS, and the ratio of disk to memory sorts.
+prompt
+
+
+set pages 9999;
+column mydate heading 'Yr.  Mo Dy  Hr.' format a16
+column sorts_memory  format 999,999,999
+column sorts_disk    format 999,999,999
+column ratio         format .99999
+
+select
+   to_char(snap_time,'yyyy-mm-dd HH24') mydate,
+   newmem.value-oldmem.value sorts_memory,
+   newdsk.value-olddsk.value sorts_disk,
+   ((newdsk.value-olddsk.value)/(newmem.value-oldmem.value)) ratio
+from
+   perfstat.stats$sysstat oldmem,
+   perfstat.stats$sysstat newmem,
+   perfstat.stats$sysstat newdsk,
+   perfstat.stats$sysstat olddsk,
+   perfstat.stats$snapshot   sn
+where
+   newdsk.snap_id = sn.snap_id
+and
+   olddsk.snap_id = sn.snap_id-1
+and
+   newmem.snap_id = sn.snap_id
+and
+   oldmem.snap_id = sn.snap_id-1
+and
+   oldmem.name = 'sorts (memory)'
+and
+   newmem.name = 'sorts (memory)'
+and
+   olddsk.name = 'sorts (disk)'
+and
+   newdsk.name = 'sorts (disk)'
+and
+   newmem.value-oldmem.value > 0
+   and
+   newdsk.value-olddsk.value > 100
+;
+
+prompt
+prompt  SORTS average sorts, ordered by hour of the day
+prompt
+
+
+set pages 9999;
+
+column sorts_memory  format 999,999,999
+column sorts_disk    format 999,999,999
+column ratio         format .99999
+
+select
+   to_char(snap_time,'HH24'),
+   avg(newmem.value-oldmem.value) sorts_memory,
+   avg(newdsk.value-olddsk.value) sorts_disk
+from
+   perfstat.stats$sysstat oldmem,
+   perfstat.stats$sysstat newmem,
+   perfstat.stats$sysstat newdsk,
+   perfstat.stats$sysstat olddsk,
+   perfstat.stats$snapshot   sn
+where
+   newdsk.snap_id = sn.snap_id
+and
+   olddsk.snap_id = sn.snap_id-1
+and
+   newmem.snap_id = sn.snap_id
+and
+   oldmem.snap_id = sn.snap_id-1
+and
+   oldmem.name = 'sorts (memory)'
+and
+   newmem.name = 'sorts (memory)'
+and
+   olddsk.name = 'sorts (disk)'
+and
+   newdsk.name = 'sorts (disk)'
+and
+   newmem.value-oldmem.value > 0
+group by
+   to_char(snap_time,'HH24')
+;
+
+prompt
+prompt  SORTS averages by the day of the week.
+prompt
+
+
+set pages 9999;
+
+column sorts_memory  format 999,999,999
+column sorts_disk    format 999,999,999
+column ratio         format .99999
+
+select
+   to_char(snap_time,'day')       DAY,
+   avg(newmem.value-oldmem.value) sorts_memory,
+   avg(newdsk.value-olddsk.value) sorts_disk
+from
+   perfstat.stats$sysstat oldmem,
+   perfstat.stats$sysstat newmem,
+   perfstat.stats$sysstat newdsk,
+   perfstat.stats$sysstat olddsk,
+   perfstat.stats$snapshot   sn
+where
+   newdsk.snap_id = sn.snap_id
+and
+   olddsk.snap_id = sn.snap_id-1
+and
+   newmem.snap_id = sn.snap_id
+and
+   oldmem.snap_id = sn.snap_id-1
+and
+   oldmem.name = 'sorts (memory)'
+and
+   newmem.name = 'sorts (memory)'
+and
+   olddsk.name = 'sorts (disk)'
+and
+   newdsk.name = 'sorts (disk)'
+and
+   newmem.value-oldmem.value > 0
+group by
+   to_char(snap_time,'day')
+;
+
+
+
+@verio  -------------------------------------------------------------------------------------------------------------------------
+
+
+-- for educational use only - use at your own risk!
+-- display physical IO statistics from DBA_HIST_SYSSTAT
+-- specifically redo size, physical reads and physical writes
+
+prompt 
+prompt === physical IO: redo size, physical reads and physical writes
+prompt
+
+set lines 140 pages 
+set verify off
+SELECT redo_hist.snap_id AS SnapshotID
+,TO_CHAR(redo_hist.snaptime, 'DD-MON HH24:MI:SS') as SnapshotTime
+,ROUND(redo_hist.statval/elapsed_time/1048576,2) AS Redo_MBsec
+,SUBSTR(RPAD('*', 20 * ROUND ((redo_hist.statval/elapsed_time) / MAX (redo_hist.statval/elapsed_time) OVER (), 2), '*'), 1, 20) AS Redo_Graph
+,ROUND(physical_read_hist.statval/elapsed_time/1048576,2) AS Read_MBsec
+,SUBSTR(RPAD('*', 20 * ROUND ((physical_read_hist.statval/elapsed_time) / MAX (physical_read_hist.statval/elapsed_time) OVER (), 2), '*'), 1, 20) AS Read_Graph
+,ROUND(physical_write_hist.statval/elapsed_time/1048576,2) AS Write_MBsec
+,SUBSTR(RPAD('*', 20 * ROUND ((physical_write_hist.statval/elapsed_time) / MAX (physical_write_hist.statval/elapsed_time) OVER (), 2), '*'), 1, 20) AS Write_Graph
+FROM (SELECT s.snap_id
+,g.value AS stattot
+,s.end_interval_time AS snaptime
+,NVL(DECODE(GREATEST(VALUE, NVL(lag (VALUE) OVER (PARTITION BY s.dbid, s.instance_number, g.stat_name
+ORDER BY s.snap_id), 0)), VALUE, VALUE - LAG (VALUE) OVER (PARTITION BY s.dbid, s.instance_number, g.stat_name
+ORDER BY s.snap_id), VALUE), 0) AS statval ,(EXTRACT(day FROM s.end_interval_time)-EXTRACT(day FROM s.begin_interval_time))*86400 +
+(EXTRACT(hour FROM s.end_interval_time)-EXTRACT(hour FROM s.begin_interval_time))*3600 +
+(EXTRACT(minute FROM s.end_interval_time)-EXTRACT(minute FROM s.begin_interval_time))*60 +
+(EXTRACT(second FROM s.end_interval_time)-EXTRACT(second FROM s.begin_interval_time)) as elapsed_time
+FROM dba_hist_snapshot s,
+dba_hist_sysstat g,
+v$instance i
+WHERE s.snap_id = g.snap_id
+AND s.begin_interval_time >= sysdate-NVL('&num_days', 1)
+AND s.instance_number = i.instance_number
+AND s.instance_number = g.instance_number
+AND g.stat_name = 'redo size') redo_hist,
+(SELECT s.snap_id
+,g.value AS stattot
+,NVL(DECODE(GREATEST(VALUE, NVL(lag (VALUE) OVER (PARTITION BY s.dbid, s.instance_number, g.stat_name
+ORDER BY s.snap_id), 0)), VALUE, VALUE - LAG (VALUE) OVER (PARTITION BY s.dbid, s.instance_number, g.stat_name
+ORDER BY s.snap_id), VALUE), 0) AS statval
+FROM dba_hist_snapshot s,
+dba_hist_sysstat g,
+v$instance i
+WHERE s.snap_id = g.snap_id
+AND s.begin_interval_time >= sysdate-NVL('&num_days', 1)
+AND s.instance_number = i.instance_number
+AND s.instance_number = g.instance_number
+AND g.stat_name = 'physical read total bytes') physical_read_hist,
+(SELECT s.snap_id
+,g.value AS stattot
+,NVL(DECODE(GREATEST(VALUE, NVL(lag (VALUE) OVER (PARTITION BY s.dbid, s.instance_number, g.stat_name
+ORDER BY s.snap_id), 0)), VALUE, VALUE - LAG (VALUE) OVER (PARTITION BY s.dbid, s.instance_number, g.stat_name
+ORDER BY s.snap_id), VALUE), 0) AS statval
+FROM dba_hist_snapshot s,
+dba_hist_sysstat g,
+v$instance i
+WHERE s.snap_id = g.snap_id
+AND s.begin_interval_time >= sysdate-NVL('&num_days', 1)
+AND s.instance_number = i.instance_number
+AND s.instance_number = g.instance_number
+AND g.stat_name = 'physical write total bytes') physical_write_hist
+WHERE redo_hist.snap_id = physical_read_hist.snap_id
+AND redo_hist.snap_id = physical_write_hist.snap_id
+ORDER BY 1;
+
+
+@verlecturas -------------------------------------------------------------------------------------------------------------------------
+
+set echo off
+
+prompt
+prompt  .: Top sesiones con mas lecturas fisicas
+prompt
+
+set linesize 120
+col os_user format a10
+col username format a15
+
+col pid format 9999999999
+PROMPT SESSIONS SORTED BY PHYSICAL READS
+PROMPT
+select
+  OSUSER os_user,username,
+    PROCESS pid,
+    ses.SID sid,
+    SERIAL#,
+    PHYSICAL_READS,
+	CONSISTENT_GETS,
+     BLOCK_CHANGES
+ from       v$session ses,
+   v$sess_io sio
+  where      ses.SID = sio.SID
+and username is not null
+and status='ACTIVE'
+order      by PHYSICAL_READS;
+
+
+prompt
+prompt  .: Top sesiones con mas lecturas logicas
+prompt
+
+
+set pagesize 200
+set linesize 120
+col segment_name format a20
+col owner format a10
+
+select segment_name,object_type,total_logical_reads
+from ( select owner||'.'||object_name as segment_name,object_type,
+value as total_logical_reads
+from v$segment_statistics
+where statistic_name in ('logical reads')
+order by total_logical_reads desc)
+where rownum <=10;
+
+
+prompt
+prompt  .: Lecturas del dia
+prompt
+
+select instance_number,
+TO_CHAR (begin_time, 'YYYYMMDDHH24') || CASE
+    WHEN  TO_CHAR (begin_time, 'MI') >= '55'  THEN  '55'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '50'  THEN  '50'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '45'  THEN  '45'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '40'  THEN  '40'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '35'  THEN  '35'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '30'  THEN  '30'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '25'  THEN  '25'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '20'  THEN  '20'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '15'  THEN  '15'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '10'  THEN  '10'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '5'  THEN  '05'
+                 ELSE  '00'
+    END sample
+,round((sum(value)/count(*)/100)*100,00) PIO_READS from DBA_HIST_SYSMETRIC_HISTORY
+where METRIC_NAME in ('Physical Reads Per Sec')
+AND GROUP_ID=2
+and instance_number = 1
+--and begin_time > sysdate-(18/24)
+--and begin_time > sysdate -1
+and end_time < sysdate -1
+group by instance_number,
+          TO_CHAR (begin_time, 'YYYYMMDDHH24') || CASE
+    WHEN  TO_CHAR (begin_time, 'MI') >= '55'  THEN  '55'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '50'  THEN  '50'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '45'  THEN  '45'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '40'  THEN  '40'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '35'  THEN  '35'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '30'  THEN  '30'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '25'  THEN  '25'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '20'  THEN  '20'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '15'  THEN  '15'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '10'  THEN  '10'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '5'  THEN  '05'
+                 ELSE  '00'
+    END
+ORDER BY 2 desc,1;
+
+
+set echo on
+
+
+
+@verinvalid ------------------------------------------------------------------------------------------------------------------------
+
+set echo off
+set heading on
+
+prompt
+prompt  .: Listado objetos invalidos
+prompt
+
+
+SELECT 
+ 'alter '||decode(object_type,'PACKAGE BODY','PACKAGE',object_type) ||' '||owner||
+  '."'||object_name||'" '||decode(object_type,'PACKAGE BODY','COMPILE BODY','COMPILE')||';' 
+ FROM all_objects 
+ WHERE owner like '%'
+ AND owner not in ('SYS', 'SYSTEM')
+ AND object_type IN 
+ ('PACKAGE','PACKAGE BODY','VIEW','PROCEDURE','TRIGGER','FUNCTION') 
+ AND status='INVALID';	
+
+prompt
+prompt  .: Resumen objetos invalidos
+prompt
+-- Número de objetos inválidos:
+SELECT owner, count(*) FROM DBA_OBJECTS WHERE STATUS='INVALID'
+group by owner;
+
+SELECT NVL(COUNT(*),0) "TOTAL"
+  FROM DBA_OBJECTS
+WHERE STATUS = 'INVALID' 
+  AND OBJECT_TYPE <> 'SYNONYM';
+
+
+prompt
+prompt .: Listado indices invalidos
+prompt
+
+select 'alter index '||owner||'.'||index_name||' rebuild tablespace '|| TABLESPACE_NAME||';'
+from dba_indexes where status = 'UNUSABLE';
+
+
+select table_owner,index_name,status
+from dba_INDEXES
+where status <> 'VALID';
+
+set echo on
+
+
+@tbsp -------------------------------------------------------------------------------------------------------------------------------
+
+
+set echo off
+set timing off
+
+Set Linesize 200
+Set Pagesize 45
+Set Desc Linenum On
+
+Set Arraysize 1
+Set Long 2000
+Set Serveroutput On size 800000 ;
+
+Set Heading  Off
+Set Feedback On
+Set Verify   Off
+
+COLUMN y new_value sid NOPRINT
+SELECT name||'_'||TO_CHAR(sysdate, 'ddmonyy_hh24mi') y FROM v$database;
+
+alter session set nls_numeric_characters='.,';
+
+Column Var_DB_BLOCK_SIZE new_value Var_DB_BLOCK_SIZE noprint
+
+Select value Var_DB_BLOCK_SIZE
+  from v$parameter
+ where Upper(name) = Upper ('db_block_size');
+
+Set Termout  On
+Set Heading  On
+
+clear breaks
+break on contents -
+skip 1
+compute Sum of alloc used free nbfrag on contents
+
+column tblsp         format a20 wrap          heading  "Tablespace Name"
+column Alloc         format 999,999           heading  "Alloc|(Mb)"
+column Free          format 999,999           heading  "Free|(Mb)"
+column used          format 999,999           heading  "Used|(Mb)"
+column pused         format 990.9             heading  "%|Used|Space"
+column fragmax       format 99,999.9          heading  "Largest|Free|Ext.(Mb)"
+column nbfrag        format 99999             heading  "Nb|frag"
+column contents      format a10               heading  "Content"
+column pct_ext_coal  format 999               heading  "% Ext.|Coal."
+column spacet         format 999             heading  "%Used|Space"
+column autoext       format a3 wrap           heading  "Auto|Ext."
+column maxbytes      format 9999,999          heading   "MaxMB"
+
+
+Ttitle  ' [ Tablespaces ]'  skip 1
+select contents
+	 , nvl (dt.tablespace_name, nvl (fsp.tablespace_name, 'Unknown')) tblsp
+	 , alloc
+	 , alloc - nvl (free, 0)       Used
+	 , nvl (free, 0)               Free
+	 , ((alloc - nvl (free, 0)) / alloc) * 100  pused
+	 , nbfrag
+	 , fragmax
+	 , dfsc.pct_ext_coal pct_ext_coal
+	 ,case
+	  when  df.maxbytes <>0
+	  then
+		((((df.maxbytes) - nvl (free,0)) / (df.maxbytes)) * 100)
+	  else
+		((df.maxbytes) - nvl (free,0) / alloc)*100
+	  end spacet
+	 , df.inc                           autoext
+	 , df.maxbytes			maxbytes
+  from ( select sum (bytes)/1048576     free
+			  , max (bytes)/1048576     fragmax
+			  , tablespace_name
+			  , count(*)                nbfrag
+		  from  sys.dba_free_space
+		 group  by tablespace_name
+	   ) fsp
+	,  ( select sum(bytes)/1048576      alloc
+			  , tablespace_name
+			  , Decode(((inc * &Var_DB_BLOCK_SIZE)/1024), Null, 'No', 'Yes')     inc
+			  , sum(maxbytes)/1048576	maxbytes
+		   from sys.dba_data_files sddf
+			  , sys.filext$        aut
+		  where sddf.file_id       =  aut.file#   (+)
+		  group by tablespace_name 
+				 , Decode(((inc * &Var_DB_BLOCK_SIZE)/1024), Null, 'No', 'Yes'),
+				 maxbytes
+		  Union
+				 select sum(bytes)/1048576      alloc
+			   , tablespace_name
+			   , Decode(((increment_by * &Var_DB_BLOCK_SIZE)/1024), Null, 'No', 'Yes')    inc
+			   , sum(maxbytes)/1048576 	maxbytes
+			from sys.dba_temp_files sddf
+		   group by tablespace_name
+				  , Decode(((increment_by * &Var_DB_BLOCK_SIZE)/1024), Null, 'No', 'Yes'),
+				  maxbytes
+	   ) df
+	,  ( select contents
+			  , tablespace_name
+			  , initial_extent/1024     initial_ext
+			  , next_extent/1024        next_ext
+			  , pct_increase
+			  , max_extents
+			  , min_extents
+			  , Substr(extent_management,1,5)       ext_manage
+		   from dba_tablespaces
+	   ) dt
+	 , ( select percent_extents_coalesced    pct_ext_coal
+			  , tablespace_name
+		   from dba_free_space_coalesced
+	   ) dfsc
+ where fsp.tablespace_name  (+)   =   dt.tablespace_name
+   and df.tablespace_name   (+)   =   dt.tablespace_name
+   and dfsc.tablespace_name (+)   =   dt.tablespace_name
+ order by contents, pused desc
+;
+
+
+Ttitle Off
+Set Heading  On
+Set Feedback On
+Set Verify   On
+Set Timing on
+
+--------------------
+--Ts bueno - tbsp2:
+set linesize 450
+set pagesize 5000
+col BYTES           format 999,999,999,999
+col MAXBYTES        format 999,999,999,999
+SELECT d.tablespace_name "Name",
+--d.STATUS "Status",
+--d.contents "Type",
+--d.extent_management "Extent Management",
+--d.initial_extent "Initial Extent",
+TO_CHAR(NVL(a.bytes / 1024 / 1024, 0),'99,999,990.900') "Size (M)",
+TO_CHAR(NVL(a.bytes - NVL(f.bytes, 0), 0)/1024/1024,'99,999,999.999') "Used (M)",
+TO_CHAR(NVL((a.bytes - NVL(f.bytes, 0)) / a.bytes * 100, 0), '990.00') "Used %",
+TO_CHAR(NVL(a.maxbytes / 1024 / 1024, 0),'99,999,990.900') "MaxSize (M)",
+TO_CHAR(NVL((a.bytes - NVL(f.bytes, 0)) / a.maxbytes * 100, 0), '990.00') "Used % of Max"
+FROM sys.dba_tablespaces d,
+(SELECT tablespace_name, 
+SUM(bytes) bytes, 
+SUM(decode(autoextensible,'NO',bytes,'YES',maxbytes))
+maxbytes FROM dba_data_files GROUP BY tablespace_name
+union all
+SELECT tablespace_name,
+SUM(bytes) bytes,
+SUM(decode(autoextensible,'NO',bytes,'YES',maxbytes))
+maxbytes FROM dba_temp_files GROUP BY tablespace_name) a,
+(SELECT tablespace_name, SUM(bytes) bytes FROM dba_free_space 
+GROUP BY tablespace_name) f
+WHERE d.tablespace_name = a.tablespace_name(+)
+AND d.tablespace_name = f.tablespace_name(+)
+ORDER BY 6 DESC;
+
+SELECT   A.tablespace_name tablespace, D.mb_total,
+         SUM (A.used_blocks * D.block_size) / 1024 / 1024 mb_used,
+         D.mb_total - SUM (A.used_blocks * D.block_size) / 1024 / 1024 mb_free
+FROM     v$sort_segment A,
+         (
+         SELECT   B.name, C.block_size, SUM (C.bytes) / 1024 / 1024 mb_total
+         FROM     v$tablespace B, v$tempfile C
+         WHERE    B.ts#= C.ts#
+         GROUP BY B.name, C.block_size
+         ) D
+WHERE    A.tablespace_name = D.name
+GROUP by A.tablespace_name, D.mb_total;
+
+
+
+
+select FILE_NAME, TABLESPACE_NAME, 
+TO_CHAR(NVL(bytes / 1024 / 1024, 0),'99,999,990.900') "Size (M)",
+AUTOEXTENSIBLE,TO_CHAR(NVL(maxbytes / 1024 / 1024, 0),'99,999,990.900')  "MAXBYTES" from dba_temp_files;
+	
+--ASM:
+
+-- TAMAÑOS: size, Tmaño total, tamaño libre
+select GROUP_NUMBER, name, state, type, round(total_mb/1024,2) TOTAL_GB, round(free_mb/1024,2) free_GB,round((total_mb-free_mb)/total_mb*100,0) "%TOTAL" from v$asm_diskgroup;
+
+--por disco:
+col NAME format a13
+col PATH format a15
+set pages 9000 lines 420
+select GROUP_NUMBER,DISK_NUMBER,NAME, MOUNT_STATUS,HEADER_STATUS, STATE, VOTING_FILE, MODE_STATUS, total_mb/1024 TOTAL_GB,FREE_MB,PATH from v$asm_disk;
+
+
+col NAME format a13
+col PATH format a15
+set pages 9000 lines 420
+select GROUP_NUMBER,DISK_NUMBER,NAME,  total_mb/1024 TOTAL_GB,FREE_MB,PATH from v$asm_disk;
+
+SELECT * FROM V$FLASH_RECOVERY_AREA_USAGE;
+
+set lines 100
+col name format a60
+select	name
+,	floor(space_limit / 1024 / 1024) "Size MB"
+,	ceil(space_used  / 1024 / 1024) "Used MB"
+from	v$recovery_file_dest
+order by name
+/
+
+
+-- FILES: DBA_SCRIPTS > asm> asm_files.sql
+
+
+SELECT name, a.VALUE
+FROM v$sesstat a, v$sysstat b
+WHERE b.statistic# = a.statistic#
+AND b.name = 'redo size'
+AND a.sid = (SELECT sid FROM v$mystat WHERE ROWNUM = 1);
+
+@sqlrt --------------------------------------------------------------------------------------------------------------------------
+
+prompt
+prompt  Top SQL Response TIME 2h -- gv$metric
+prompt
+
+select to_char(MAX(VALUE),  'FM99999999999999.9999') retvalue FROM GV$METRIC where   
+METRIC_NAME in ('SQL Service Response Time') AND GROUP_ID=2 ORDER BY 1;
+
+select inst_id,
+TO_CHAR (begin_time, 'YYYYMMDDHH24') || CASE
+    WHEN  TO_CHAR (begin_time, 'MI') >= '55'  THEN  '55'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '50'  THEN  '50'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '45'  THEN  '45'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '40'  THEN  '40'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '35'  THEN  '35'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '30'  THEN  '30'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '25'  THEN  '25'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '20'  THEN  '20'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '15'  THEN  '15'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '10'  THEN  '10'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '5'  THEN  '05'
+                 ELSE  '00'
+         END sample
+,round((sum(value)/count(*)/100)*1000,00) SQL_msecs from gV$SYSMETRIC_HISTORY
+where METRIC_NAME in ('SQL Service Response Time')
+AND GROUP_ID=2
+group by inst_id,
+          TO_CHAR (begin_time, 'YYYYMMDDHH24') || CASE
+    WHEN  TO_CHAR (begin_time, 'MI') >= '55'  THEN  '55'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '50'  THEN  '50'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '45'  THEN  '45'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '40'  THEN  '40'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '35'  THEN  '35'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '30'  THEN  '30'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '25'  THEN  '25'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '20'  THEN  '20'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '15'  THEN  '15'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '10'  THEN  '10'
+    WHEN  TO_CHAR (begin_time, 'MI') >= '5'  THEN  '05'
+                                                ELSE  '00'
+         END
+ORDER BY 2 desc;
+
+
+
+@longo --------------------------------------------------------------------------------------------------------------------------
+set echo off
+set pages 6000 lines 350
+set feedback off
+set timing off
+--set termout off
+set trimspool on 
+set verify off
+
+Ttitle  ' [ Long running operations ]'  skip 2
+SELECT SID, SERIAL#, opname ||'  '|| target, SOFAR, TOTALWORK,
+ROUND(SOFAR/TOTALWORK*100,2) "COMPLETE%", ELAPSED_SECONDS "EMPEZO(sec)",
+TIME_REMAINING "ESTIMACION (sec)", sysdate + TIME_REMAINING/3600/24 end_at
+FROM   V$SESSION_LONGOPS
+WHERE
+TOTALWORK != 0
+AND    SOFAR != TOTALWORK
+order by 1;
+
+set feedback on
+set timing on
+--set termout off
+set trimspool off 
+set verify on
+TTITLE OFF
+set echo on
+
+
+
+@verbd -----------------------------------------------------------------------------------------------------------------------------
+
+Set echo off
+set ttitle off
+set timing off
+Set Linesize 200
+Set Pagesize 45
+Set Desc Linenum On
+
+Set Arraysize 1
+Set Long 2000
+Set Serveroutput On size 800000 ;
+
+Set Heading  on
+Set Feedback Off
+Set Verify   Off
+
+select event, state, count(*) from v$session_wait group by event, state order by 3 desc;
+
+set timing on
+Set Linesize 200
+Set Pagesize 45
+Set Desc Linenum On
+
+Set Arraysize 1
+Set Long 2000
+Set Serveroutput On size 800000 ;
+
+Set Heading  on
+Set Feedback On
+Set Verify   On
+Set echo on
+
+
+
+--- SQL – STATSPACK TOP 5 EVENTS
+with top_events as (
+select snap_id, stime, name, null waits, round(diff/100) time
+from (
+    select  c.snap_id,
+            to_char(c.snap_time, 'yyyymmdd hh24') stime,
+            b.name,
+            b.value,
+            lag(b.value) over (partition by name order by b.snap_id) last_val,
+            b.value – lag(b.value) over (partition by name order by b.snap_id) diff
+    from    stats$sysstat b,
+            stats$snapshot c
+    where   c.snap_id = b.snap_id
+    and     b.name = 'CPU used by this session'
+    and     c.snap_time between to_date('20141203 090000', 'yyyymmdd hh24miss')
+                            and to_date('20141203 114000', 'yyyymmdd hh24miss')
+    order by 3, 1)
+where last_val is not null
+union all
+select snap_id, stime, event, waits, wait_seconds time
+from (
+     select snap_id, stime, event, rank() over (partition by snap_id order by diff_wait_time_micro desc) ranking,
+            round(diff_waits) waits,
+            round(diff_wait_time_micro/1000000) wait_seconds
+       from ( 
+         select  c.snap_id,
+                 to_char(c.snap_time, 'yyyymmdd hh24') stime,
+                 b.event,
+                 b.total_waits,
+                 lag(b.total_waits) over (partition by b.event order by b.snap_id) last_total_waits,
+                 b.time_waited_micro,
+                 lag(b.time_waited_micro) over (partition by b.event order by b.snap_id) last_total_time_micro,
+                 b.total_waits – lag(b.total_waits) over (partition by b.event order by b.snap_id) diff_waits,
+                 b.time_waited_micro – lag(b.time_waited_micro) over (partition by b.event order by b.snap_id) diff_wait_time_micro,
+                 d.wait_class
+         from    stats$system_event b,
+                 stats$snapshot c,
+                 v$system_event d
+         where   c.snap_id = b.snap_id
+         and     b.event_id = d.event_id
+         and     d.wait_class != 'Idle'
+         and     c.snap_time between to_date('20141203 090000', 'yyyymmdd hh24miss')
+         and 	 to_date('20141203 114000', 'yyyymmdd hh24miss')
+         order by 3, 1)
+     where diff_waits is not null
+)
+order by 1, 5 desc)
+select b.*
+  from (select row_number() over (partition by snap_id order by time desc) rn, a.*
+          from top_events a) b
+ where rn <= 5;
+
+
+
+
+
+
+
+
+
+@vercursores -----------------------------------------------------------------------------------------------------------------------
+Set Heading  On
+set pagesize 5000
+set echo off
+Set Feedback Off
+Set Verify   Off
+
+
+Ttitle  ' [ STAT CURSOR ]'  skip 2
+select to_char(100 * sess / calls, '999999999990.00') || '%' cursor_cache_hits,
+to_char(100 * (calls - sess - hard) / calls, '999990.00') || '%' soft_parses,
+to_char(100 * hard / calls, '999990.00') || '%' hard_parses
+from ( select value calls from v$sysstat where name = 'parse count (total)' ),
+( select value hard from v$sysstat where name = 'parse count (hard)' ),
+( select value sess from v$sysstat where name = 'session cursor cache hits' )
+/
+
+Ttitle  ' [ TOTAL CURSORES POR SID ]'  skip 2
+select sid,count(*) from v$open_cursor group by sid;
+
+Ttitle  ' [ TOTAL CURSORES ]'  skip 2
+select count(*) from v$open_cursor;
+
+
+Ttitle  ' [ cuantos hay abiertos por sesion? ]'  skip 2 
+select a.value, s.username, s.sid, s.serial#
+from v$sesstat a, v$statname b, v$session s
+where a.statistic# = b.statistic# 
+and s.sid=a.sid and b.name = 'opened cursors current'
+/
+Ttitle  ' [ cuantos cursores abiertos por usuario y maquina? ]'  skip 2      
+select sum(a.value) total_cur, avg(a.value) avg_cur, max(a.value) max_cur, s.username, s.machine
+from v$sesstat a, v$statname b, v$session s 
+where a.statistic# = b.statistic#  
+and s.sid=a.sid and b.name = 'opened cursors current'
+group by s.username, s.machine order by 1 desc
+/
+Ttitle  ' [ Que niveles hay? ]'  skip 2
+select max(a.value) as highest_open_cur, p.value as max_open_cur 
+from v$sesstat a, v$statname b, v$parameter p 
+where a.statistic# = b.statistic#  
+and b.name = 'opened cursors current' 
+and p.name= 'open_cursors' group by p.value
+/
+Ttitle  ' [ % uso de del cacheo de cursores y cursores abiertos ]'  skip 2       
+--Si el valor del SESSION_CACHED_CURSORS se encuentra en el 100%, deberíamos incrementar el valor del parámetro con normalidad.
+
+select 'session_cached_cursors'  parameter,
+lpad(value, 5)  value,
+decode(value, 0, '  n/a', to_char(100 * used / value, '990') || '%')  usage
+from
+( select
+    max(s.value)  used
+  from
+    sys.v_$statname  n,
+    sys.v_$sesstat  s
+  where
+    n.name = 'session cursor cache count' and
+    s.statistic# = n.statistic#
+),
+( select
+    value
+  from
+    sys.v_$parameter
+  where
+    name = 'session_cached_cursors'
+)
+union all
+select
+'open_cursors',
+lpad(value, 5),
+to_char(100 * used / value,  '990') || '%'
+from
+( select
+    max(sum(s.value))  used
+  from
+    sys.v_$statname  n,
+    sys.v_$sesstat  s
+  where
+    n.name in ('opened cursors current', 'session cursor cache count') and
+    s.statistic# = n.statistic#
+  group by
+    s.sid
+),
+( select
+    value
+  from
+    sys.v_$parameter
+  where
+    name = 'open_cursors'
+)
+/
+
+Ttitle Off
+Set Heading  On
+Set Feedback On
+Set Verify   On
+
+
+@vercur -----------------------------------------------------------------------------------------------------------------
+
+SELECT * FROM table(DBMS_XPLAN.DISPLAY_CURSOR(('&1'),0));
+
+@stats --------------------------------------------------------------------------------------------------------------------
+
+-- Session stats by a specific SID
+col username format A15;
+col os_user format a40
+select	nvl(ses.USERNAME,'ORACLE PROC') username,
+	OSUSER os_user,
+	PROCESS pid,
+	ses.SID sid,
+	SERIAL#,
+	PHYSICAL_READS,
+	BLOCK_GETS,
+	CONSISTENT_GETS,
+	BLOCK_CHANGES,
+	CONSISTENT_CHANGES
+from	v$session ses, 
+	v$sess_io sio
+where 	ses.SID = sio.SID
+        and ses.SID = &sid
+order 	by PHYSICAL_READS, ses.USERNAME
+/
+
+@sqltune --------------------------------------------------------------------------------------------------------------------
+
+ALTER SESSION SET nls_date_format='dd-mon-yyyy hh24:mi:ss';
+
+DECLARE
+stmt_task VARCHAR2(100);
+t_name    VARCHAR2(100);
+s_id      VARCHAR2(100);
+BEGIN
+s_id   := '&sql_id';
+t_name := s_id || '_' || TO_CHAR(SYSDATE,'YYYYMMDD_MISS');
+stmt_task := DBMS_SQLTUNE.CREATE_TUNING_TASK(
+      task_name => t_name
+  ,   sql_id => s_id);
+DBMS_SQLTUNE.SET_TUNING_TASK_PARAMETER (
+      task_name => t_name
+  ,   parameter => 'TIME_LIMIT'
+  ,   value     => 300
+);
+DBMS_SQLTUNE.EXECUTE_TUNING_TASK(task_name => t_name);
+DBMS_OUTPUT.PUT_LINE('SET PAGES 512 LINES 140');
+DBMS_OUTPUT.PUT_LINE('SET LONG 99999');
+DBMS_OUTPUT.PUT_LINE('COL RECOMMENDATIONS FORMAT A140');
+DBMS_OUTPUT.PUT_LINE('SELECT DBMS_SQLTUNE.REPORT_TUNING_TASK('''||t_name||''') AS recommendations FROM dual;');
+END;
+/
+
+
+@cursores --------------------------------------------------------------------------------------------------------------------
+
+COL SI FORMAT 99  HEAD 'Sid'
+col ST format a55 head ' Sql Text' WORD
+
+SET LONG 1000
+SET VER OFF
+SET PAGESIZE 22
+set feed off
+
+SELECT  H.SID                SI
+,       S.sql_text           ST
+,	  S.SORTS
+,	  S.DISK_READS		"DISKR"
+,	  S.BUFFER_GETS		"BUFFG"
+,	s.executions
+-- ,	  S.ROWS_PROCESSED	"ROWS"
+FROM    V$OPEN_CURSOR O
+,       V$SQLAREA     S
+,       V$SESSION     H
+WHERE   S.HASH_VALUE= S.HASH_VALUE
+AND     S.ADDRESS = O.ADDRESS 
+AND     H.SID = '&1'
+AND     O.SADDR = H.SADDR
+ORDER BY H.SID,O.USER_NAME
+/
+set feed on
+set head on
+
+
+--define usuario=&1
+--and     o.user_name = upper('&usuario')
+
+
+@vertab-----------------------------------------------------------------------------------------------------------------------
+--@vertab
+-- enter owner and tablename
+-- WCORAPRD ORDERITEMS' 
+
+set pagesize 5000
+set linesize 350
+set echo off
+col table_name for a25
+col SEGMENT_NAME for a25
+alter session set nls_date_format = 'dd-mm-yyyy hh24:mi:ss';
+
+-- define owner and table name
+define own = &1
+define tab = &2
+
+
+Ttitle  ' [ INFO ]'  skip 1
+select OBJECT_NAME,OWNER,OBJECT_TYPE  ,CREATED,LAST_DDL_TIME,STATUS  from dba_objects where object_name like '%&tab%'
+and owner = '&own';
+
+Ttitle  ' [ Tamaño Tabla ]'  skip 1
+select SEGMENT_NAME, bytes/1024/1024 Table_Allocation_MB 
+from dba_segments
+where SEGMENT_NAME like '&tab'
+and owner = '&own';
+
+Ttitle  ' [ Tamaño Tabla+Indices ]'  skip 1
+select sum(bytes)/1024/1024 Table_Allocation_MB 
+from dba_segments
+where segment_type in ('TABLE','INDEX') and
+(segment_name='&tab' or segment_name in 
+(select index_name from dba_indexes where table_name='&tab'));
+
+Ttitle  ' [ Espacio Reservado ]'  skip 1
+select table_name, NUM_ROWS,(blocks*8/1024)+ROUND((AVG_ROW_LEN * NUM_ROWS / (1024 * 1024)), 2) TOTAL, blocks*8/1024 Reserved_MB,  ROUND((AVG_ROW_LEN * NUM_ROWS / (1024 * 1024)), 2) Consumed_MB,
+((blocks*8/1024)*100)/((blocks*8/1024)+ROUND((AVG_ROW_LEN * NUM_ROWS / (1024 * 1024)), 2)) RESERV
+from all_tables 
+where table_name like '&tab' 
+and NUM_ROWS > 1
+order by 4,6 desc;
+
+Ttitle  ' [ COLUMNAS ]'  skip 1
+select column_name,DATA_TYPE from dba_tab_columns where table_name = '&tab' 
+and owner = '&own' order by column_id;
+
+Ttitle  ' [ INDEXES ]'  skip 1
+select index_name,INDEX_TYPE, PARTITIONED ,TABLE_TYPE
+from dba_indexes WHERE table_name = '&tab';
+
+
+
+
+
+set echo on
+
+@veridx -----------------------------------------------------------------------------------------------------------------------
+
+
+
+
+column ind_table_name1 heading TABLE_NAME format a30
+column ind_index_name1 heading INDEX_NAME format a30
+column ind_table_owner1 heading TABLE_OWNER format a20
+column ind_column_name1 heading COLUMN_NAME format a30
+column ind_dsc1 heading DSC format a4
+column ind_column_position1 heading POS# format 999
+
+break on ind_table_owner1 skip 1 on ind_table_name1 on ind_index_name1
+
+undefine index_name
+
+select 
+    c.table_owner ind_table_owner1,
+    c.table_name ind_table_name1, 
+    c.index_name ind_index_name1, 
+    c.column_position ind_column_position1, 
+    c.column_name ind_column_name1, 
+    decode(c.descend,'DESC','DESC',null) ind_dsc1
+from 
+    dba_ind_columns c
+where (
+    UPPER(table_name) LIKE 
+                UPPER(CASE 
+                    WHEN INSTR('&&index_name','.') > 0 THEN 
+                        SUBSTR('&&index_name',INSTR('&&index_name','.')+1)
+                    ELSE
+                        '&index_name'
+                    END
+                     )
+)
+OR (
+    UPPER(index_name) LIKE 
+                UPPER(CASE 
+                    WHEN INSTR('&&index_name','.') > 0 THEN 
+                        SUBSTR('&&index_name',INSTR('&&index_name','.')+1)
+                    ELSE
+                        '&&index_name'
+                    END
+                     )
+)
+order by
+    c.table_owner,
+    c.table_name,
+    c.index_name,
+    c.column_position
+;
+
+
+Select owner,segment_name,partition_name,bytes/power(1024,2) MB 
+from dba_segments 
+where (owner,segment_name) in (
+select owner,index_name 
+from dba_indexes
+where index_name = '&index_name');
+
+
+@vertemp-----------------------------------------------------------------------------------------------------------------------
+
+set echo off
+
+COL SEGMENT_NAME FORMAT A30
+col tablespace_name format a20
+col tablespace format a20
+col username format a20
+col file_name format a50
+set lines 120
+
+col FILE_NAME       format a50
+col TABLESPACE_NAME format a15
+col BYTES           format 999,999,999,999
+col MAXBYTES        format 999,999,999,999
+set linesize 350
+
+SELECT   A.tablespace_name tablespace, D.mb_total,
+         SUM (A.used_blocks * D.block_size) / 1024 / 1024 mb_used,
+         D.mb_total - SUM (A.used_blocks * D.block_size) / 1024 / 1024 mb_free
+FROM     v$sort_segment A,
+         (
+         SELECT   B.name, C.block_size, SUM (C.bytes) / 1024 / 1024 mb_total
+         FROM     v$tablespace B, v$tempfile C
+         WHERE    B.ts#= C.ts#
+         GROUP BY B.name, C.block_size
+         ) D
+WHERE    A.tablespace_name = D.name
+GROUP by A.tablespace_name, D.mb_total;
+
+select FILE_ID,FILE_NAME,TABLESPACE_NAME, BYTES, MAXBYTES from  dba_temp_files;
+
+select t.file_name,h.BYTES_USED/1024/1024, h.BYTES_FREE/1024/1024
+from dba_temp_files t, V$TEMP_SPACE_HEADER h
+where t.file_id=h.file_id
+order by 1;
+
+SELECT tablespace_name, 
+	extent_size, 
+	total_extents, 
+	used_extents,          
+	free_extents, 
+	max_used_size,
+	used_blocks
+FROM v$sort_segment;  
+
+   SELECT s.sid,
+	  s.serial#,
+	s.username, 
+	u.tablespace, 
+	u.contents, 
+	u.extents, 
+	u.blocks       
+FROM v$session s, 
+	v$sort_usage u       
+WHERE s.saddr=u.session_addr
+order by s.sid; 
+
+
+Ttitle  ' [ General usage -- v$sort_usage, dba_tablespaces, v$session ses]'  skip 2
+
+set pages 999 lines 100
+col username format a15
+col mb format 999,999
+select  su.username
+,       ses.sid 
+,       ses.serial#
+,		ses.status
+,		ses.osuser
+,       su.tablespace
+,       ceil((su.blocks * dt.block_size) / 1048576) MB
+from    v$sort_usage    su
+,       dba_tablespaces dt
+,       v$session ses
+where   su.tablespace = dt.tablespace_name
+and     su.session_addr = ses.saddr
+/		  
+
+
+
+
+set echo on
+
+
+---- uso temp por sesion
+
+SELECT   S.sid || ',' || S.serial# sid_serial, S.username, S.osuser, P.spid, S.module,
+         S.program, SUM (T.blocks) * TBS.block_size / 1024 / 1024 mb_used, T.tablespace,
+         COUNT(*) sort_ops
+FROM     v$sort_usage T, v$session S, dba_tablespaces TBS, v$process P
+WHERE    T.session_addr = S.saddr
+AND      S.paddr = P.addr
+AND      T.tablespace = TBS.tablespace_name
+GROUP BY S.sid, S.serial#, S.username, S.osuser, P.spid, S.module,
+         S.program, TBS.block_size, T.tablespace
+ORDER BY mb_used;
+
+
+
+
+
+@verwait -----------------------------------------------------------------------------------------------------------------------
+
+
+
+SET LINESIZE 200
+SET PAGESIZE 1000
+
+COLUMN username FORMAT A20
+COLUMN event FORMAT A30
+col sid for 9999
+
+SELECT NVL(s.username, '(oracle)') AS username,
+       s.sid,
+       s.serial#,
+       sw.event,
+       sw.wait_time,
+       sw.seconds_in_wait,
+       sw.state
+FROM   v$session_wait sw,
+       v$session s
+WHERE  s.sid = sw.sid
+ORDER BY sw.seconds_in_wait DESC;
+
+
+@oralic --------------------------------------------------------------------------------------------------------------------
+
+
+sset pages 9000 lines 100
+set echo off verify off feedback off
+set feedback off serveroutput on
+col sys_date new_value m_timestamp;
+col global_name new_value gname;
+select to_char(sysdate,'yyyy_dd_mm_hh24_miss') sys_date from dual;
+select  global_name  from global_name;
+spool /tmp/oralic.&gname..&m_timestamp..txt
+--spool "C:/oralic.&gname..&m_timestamp..txt"
+PROMPT ===================================== 1)Uso Licencias Opciones RAC,Particionamineto,spatial,etc..
+prompt
+prompt ==== COUNT: SESSIONS, USERS, CPU
+select * from v$license;
+prompt
+prompt ================================
+select banner from v$version where BANNER like '%Edition%';
+prompt ================================
+prompt PARTICIONAMIENTO?
+select decode(count(*), 0, 'No', 'Yes') Partitioning
+from ( select 1 
+from dba_part_tables
+where owner not in ('SYSMAN', 'SH', 'SYS', 'SYSTEM')
+and rownum = 1 );
+prompt ================================
+prompt SPATIAL?
+select decode(count(*), 0, 'No', 'Yes') Spatial
+from ( select 1
+from all_sdo_geom_metadata 
+where rownum = 1 );
+prompt ================================
+prompt RAC?
+select decode(count(*), 0, 'No', 'Yes') RAC
+from ( select 1 
+from v$active_instances 
+where rownum = 1 );
+prompt ================================
+prompt OPTIONS?
+--# nearly the same as you proposed
+Col name  format a50 heading "Option"
+Col value format a5  heading "?"      justify center wrap
+Select parameter name, value
+from v$option 
+order by 2 desc, 1;
+prompt ================================
+prompt USAGE?
+Set feedback off
+Set linesize 122
+Col name             format a45     heading "Feature"
+Col version          format a10     heading "Version"
+Col detected_usages  format 999,990 heading "Detected|usages"
+Col currently_used   format a06     heading "Curr.|used?"
+Col first_usage_date format a10     heading "First use"
+Col last_usage_date  format a10     heading "Last use"
+Col nop noprint
+Break on nop skip 1 on name
+Select decode(detected_usages,0,2,1) nop,
+       name, version, detected_usages, currently_used,
+       to_char(first_usage_date,'DD/MM/YYYY') first_usage_date, 
+       to_char(last_usage_date,'DD/MM/YYYY') last_usage_date
+from dba_feature_usage_statistics
+where last_usage_date is not null
+order by nop, 1, 2;
+PROMPT
+PROMPT ===================================== 2)Uso Licencias AWR
+PROMPT
+show parameter CONTROL_MANAGEMENT_PACK_ACCESS
+prompt DISABLE: ALTER SYSTEM SET CONTROL_MANAGEMENT_PACK_ACCESS="NONE" SCOPE=BOTH;
+PROMPT
+PROMPT ===================================== 3)Uso Licencias Advanced Compression Option
+PROMPT
+PROMPT -- INFO: Advanced Compression Option (ACO):
+PROMPT 1- OLTP Table Compression
+PROMPT 2- LOB Compression
+PROMPT 3- Data Pump Compression
+PROMPT 4- Fast ZLIB RMAN Compression
+PROMPT 5- Data Guard Log Transport Compression
+prompt COMPRESSION?
+SELECT name,
+detected_usages detected, 
+FEATURE_INFO,
+total_samples samples,
+currently_used  used, 
+to_char(last_sample_date,'MMDDYYYY:HH24:MI') last_sample,
+sample_interval interval
+FROM dba_feature_usage_statistics
+where detected_usages > 0
+and name like ('%Compression%') or
+name in ('Oracle Utility Datapump','Data Guard');
+PROMPT --Necesita licencia:
+PROMPT --Backup ZLIB Compression,Backup LOW Compression,Backup MEDIUM Compression,Backup HIGH Compression,
+PROMPT --SecureFile Compression (user),SecureFile Deduplication (user),HeapCompression,Hybrid Columnar Compression
+PROMPT --Oracle Utility Datapump 
+PROMPT --Data Guard
+PROMPT --Hybrid Columnar Compression
+PROMPT
+SELECT table_name,owner, compression, compress_for FROM dba_tables where compression not like ('DISABLED');
+SELECT table_name,TABLE_OWNER, partition_name, compression, compress_for FROM dba_tab_partitions where compression not in ('DISABLED','NONE');
+SELECT TABLESPACE_NAME,def_tab_compression, compress_for FROM dba_tablespaces;
+select OWNER,TABLE_NAME,COLUMN_NAME,COMPRESSION,DEDUPLICATION,SECUREFILE from  dba_lobs where compression not in ('NONE','NO');
+select TABLE_OWNER,TABLE_NAME,COLUMN_NAME,COMPRESSION,DEDUPLICATION,SECUREFILE from  dba_lob_partitions where compression not like ('NONE');
+select DEST_NAME, COMPRESSION from v$archive_dest where compression not like ('DISABLE');
+PROMPT DISABLE COMPRESION:
+PROMPT 1. OLTP Table Compression -> _OLTP_COMPRESSION=false
+PROMPT 2- LOB Compression ->  DB_SECUREFILE=NEVER
+PROMPT 3- Data Pump Compression -> Bug 8478082: DISALLOW UNLICENSED COMPRESSION FEATURE WHILE USING DATA PUMP
+PROMPT 4- Fast ZLIB RMAN Compression -> no need license: BZIP2 or BASIC
+PROMPT 5- Data Guard Log Transport Compression -> DGMGRL> edit database 'DB_SITE1' set property RedoCompression='DISABLE'; ENABLE_OPTION_ADVANCED_COMPRESSION=FALSE
+PROMPT ===================================== 4)Uso Licencias Backup
+PROMPT
+PROMPT CHECK RMAN: RMAN -> show all; exit; -> COMPRESS ZLIB
+spool off
+
+
+@verun ---------------------------------------------------------------------------------------------------------------------
+
+
+set linesize 400
+set pgaesize 9000
+
+
+select 
+a.sid, 
+a.serial# sid, 
+a.username, 
+a.machine, 
+a.program, 
+a.status, 
+b.event, 
+b.seconds_in_wait 
+from v$session a, 
+v$session_wait b 
+where b.sid = a.sid 
+and a.username is not null 
+and status = 'ACTIVE' 
+order by b.seconds_in_wait;
+
+
+----------------------------------------------------------------------------
+-- @infodb
+--
+-- Especificacion:  Con este script se pretende obtener toda la informaci\363n necesaria para recrear, en
+--                  caso de necesario, una Base de Datos.
+--
+-- -------------------------------------------------------------------------------------------------------
+
+!echo $ORACLE_SID
+
+spool ScriptInfoBBDD_Apolo_$ORACLE_SID.log
+
+prompt ############################################################################
+prompt ##
+prompt ## Script Para Obtener toda la informaci\363n necesaria para recrear una BBDD #
+prompt ##
+prompt ############################################################################
+
+prompt
+prompt
+
+set linesize 180
+set pagesize 5000
+
+Select name Nombre_BBDD from v$database;
+select instance_name Nombre_Instancia from v$instance;
+
+! echo Oracle_Home = $ORACLE_HOME
+
+prompt
+prompt
+prompt VERSION DE ORACLE
+prompt #################
+
+prompt
+
+select * from x$version;
+
+prompt
+prompt
+prompt VERSION DEL SISTEMA OPERATIVO
+prompt #############################
+
+prompt
+
+! uname -a
+
+prompt
+prompt
+prompt OBTENER LOS PAR\301METROS DE INIT<SID>.ORA
+prompt #######################################
+
+PROMPT
+
+set linesize 180
+col name format a80
+col value format a80
+
+select distinct name, value
+from v$parameter
+where isdefault='FALSE';
+
+prompt
+"ScriptInfoBBDD.sql" 179 lines, 4134 characters
+
+prompt
+prompt
+prompt CREACI\323N DE LOS SEGMENTOS DE ROLLBACK
+prompt #####################################
+
+prompt
+
+col Segmento format a15
+col Tablespace format a15
+col Inicial format 999999999
+col Next format 999999999
+col MinExtent format 999999999
+col MaxExtent format 999999999
+col PctInc format 999
+
+select segment_name Segmento, tablespace_name Tablespace, initial_extent Inicial, next_extent Next, min_extents MinExtent,
+        max_extents MaxExtent,pct_increase PctInc
+from dba_rollback_segs;
+
+
+select 'create rollback segment '||segment_name||' tablespace '||tablespace_name||' storage ('||'initial '||initial_extent||
+' next '||next_extent||' minextents '||min_extents||' maxextents '||max_extents||');' Crear_Segmentos_Rollback
+from dba_rollback_segs
+where segment_name!='SYSTEM';
+
+select 'alter rollback segment '||segment_name||' online;' Poner_ONline_Segmentos
+from dba_rollback_segs
+where segment_name!='SYSTEM';
+
+
+spool off;
+
+@verundo -----------------------------------------------------------------------------------------------------------------------
+
+set pagesize 5000
+set linesize 350
+set echo off
+SET LONG 90000
+
+-- TABLESPACES DE UNDO - check undo 
+Ttitle  ' [ TABLESPACES DE UNDO ]'  skip 1
+col tablespace_name format a30
+col file_name format a60
+col autoextensible format a3
+col MB format 9999999.99
+col MaxMB format 9999999.99
+set lines 200
+select tablespace_name,file_name,bytes/(1024*1024) MB, autoextensible, maxbytes/(1024*1024) MaxMB
+from dba_data_files where tablespace_name in
+(select upper(value) from gv$parameter where name='undo_tablespace')
+order by tablespace_name;  
+
+-- Current undo USED and FREE space avaliable
+Ttitle  ' [ Current undo USED and FREE space avaliable ]'  skip 1
+select y.tablespace_name, y.totmb "Total size MB", round(x.usedmb*100/y.totmb,2) "% Used"
+from
+(
+select a.tablespace_name, nvl(sum(bytes),0)/(1024*1024) usedmb
+from dba_undo_extents a
+where tablespace_name in (select upper(value) from gv$parameter where name='undo_tablespace')
+and status in ('ACTIVE','UNEXPIRED')
+group by a.tablespace_name
+) x,
+(
+select b.tablespace_name, sum(bytes)/(1024*1024) totmb
+from dba_data_files b
+where tablespace_name in (select upper(value) from gv$parameter where name='undo_tablespace')
+group by b.tablespace_name
+) y
+where y.tablespace_name=x.tablespace_name
+order by y.tablespace_name;
+
+-- Who is using your Undo space?
+Ttitle  ' [ Who is using your Undo space? ]'  skip 1
+set pagesize 400
+set linesize 140
+col name for a25
+col program for a50
+col username for a12
+col osuser for a12
+SELECT a.inst_id, a.sid, c.username, c.osuser, c.program, b.name,
+a.value, d.used_urec, d.used_ublk
+FROM gv$sesstat a, v$statname b, gv$session c, gv$transaction d
+WHERE a.statistic# = b.statistic#
+AND a.inst_id = c.inst_id
+AND a.sid = c.sid
+AND c.inst_id = d.inst_id
+AND c.saddr = d.ses_addr
+AND b.name = 'undo change vector size'
+AND a.value > 0
+ORDER BY a.value DESC
+
+-- Snapshot too old?
+Ttitle  ' [ Any Snapshot too old error? ]'  skip 1
+select SSOLDERRCNT FROM v$undostat where SSOLDERRCNT!=0 order by begin_time;
+
+--Identify No space to extend undo errors
+
+select * from v$undostat where nospaceerrcnt !=0 order by begin_time;
+
+-- Complete dump of the undo statistics information
+Ttitle  ' [ Complete dump of the undo statistics information ]'  skip 1
+select TO_CHAR(MIN(Begin_Time),'DD-MON-YYYY HH24:MI:SS') "Begin Time",
+TO_CHAR(MAX(End_Time),'DD-MON-YYYY HH24:MI:SS') "End Time",
+SUM(Undoblks)    "Total Undo Blocks Used",
+SUM(Txncount)    "Total Num Trans Executed",
+MAX(Maxquerylen)  "Longest Query(in secs)",
+MAX(Maxconcurrency) "Highest Concurrent Txn count",
+SUM(Ssolderrcnt),
+SUM(Nospaceerrcnt), 
+MAX(undoblks/((end_time-begin_time)*3600*24)) "UNDO_BLOCK_PER_SEC"
+from V$UNDOSTAT;
+
+
+-- Estimate the undo tablespace size required as well as the optimal Undo Retention
+Ttitle  ' [ Estimate the undo tablespace size required ]'  skip 1
+SELECT d.undo_size/(1024*1024) "ACTUAL UNDO SIZE [MByte]",
+SUBSTR(e.value,1,25) "UNDO RETENTION [Sec]",
+(TO_NUMBER(e.value) * TO_NUMBER(f.value) *
+g.undo_block_per_sec) / (1024*1024)
+"NEEDED UNDO SIZE [MByte]"
+FROM (
+SELECT SUM(a.bytes) undo_size
+FROM v$datafile a,
+v$tablespace b,
+dba_tablespaces c
+WHERE c.contents = 'UNDO'
+AND c.status = 'ONLINE'
+AND b.name = c.tablespace_name
+AND a.ts# = b.ts#
+) d,
+v$parameter e,
+v$parameter f,
+(
+SELECT MAX(undoblks/((end_time-begin_time)*3600*24))
+undo_block_per_sec
+FROM v$undostat
+) g
+WHERE e.name = 'undo_retention'
+AND f.name = 'db_block_size'
+/
+
+-- Summarize active, expired and unexpired extents for current undo tablespaces.
+Ttitle  ' [ Active, Expired and Unexpired extents for current undo ]'  skip 1
+select tablespace_name,status, SUM (BYTES) / (1024 * 1024) AS size_mb  from dba_undo_extents
+group by tablespace_name,status order by tablespace_name, status;
+
+-- Which sessions are using UNDO right now?
+Ttitle  ' [ Which sessions are using UNDO right now ]'  skip 1
+col sid_serial format a10
+col orauser format a15
+col PROGRAM format a30
+col UNDOSEG format a12
+col sql_id format a15
+SELECT TO_CHAR(s.sid)||','||TO_CHAR(s.serial#) sid_serial,
+NVL(s.username, 'None') orauser,
+s.program, to_char(logon_time,'dd-MON-yyyy hh24:mi:ss'), round( (sysdate-logon_time), 2) * 24*60 MINS,
+r.name undoseg,
+t.used_ublk * TO_NUMBER(x.value)/1024||'K' "Undo"
+FROM sys.v_$rollname    r,
+sys.Gv_$session     s,
+sys.Gv_$transaction t,
+sys.Gv_$parameter   x
+WHERE s.taddr = t.addr
+AND r.usn   = t.xidusn(+)
+AND x.name  = 'db_block_size';
+
+
+
+-- Undo Recovery
+-- set FAST_START_PARALLEL_ROLLBACK to high to give the SMON processes priority
+select PID,CPUTIME,state,
+undoblocksdone,
+undoblockstotal,
+undoblocksdone / undoblockstotal * 100
+from v$fast_start_transactions;
+
+
+
+@verbackups -----------------------------------------------------------------------------------------------------------------------
+
+set pagesize 5000
+set linesize 350
+set echo off
+SET LONG 90000
+
+SELECT SID,OPERATION,STATUS,MBYTES_PROCESSED, START_TIME, END_TIME, OBJECT_TYPE, OUTPUT_DEVICE_TYPE 
+FROM V$RMAN_STATUS WHERE STATUS = 'RUNNING';
+
+SELECT S.CLIENT_INFO "Client Info", SL.OPNAME "Operation" ,trunc((TIME_REMAINING/60)/60) HORAS_RESTANTES,SL.MESSAGE, SL.SID, SL.SERIAL#, P.SPID "OS Process ID", SL.SOFAR "So Far", SL.TOTALWORK "Totalwork", ROUND(SL.SOFAR/SL.TOTALWORK*100,2) "% complete"
+FROM V$SESSION_LONGOPS SL INNER JOIN V$SESSION S ON SL.SID = S.SID 
+                          INNER JOIN V$PROCESS P ON P.ADDR = S.PADDR
+AND OPNAME LIKE 'RMAN%'
+AND TOTALWORK != 0
+AND SOFAR <> TOTALWORK
+/
+
+@stdby -----------------------------------------------------------------------------------------------------------------------
+
+select process,STATUS,THREAD#,SEQUENCE# ,BLOCK#,BLOCKS*512/1024/1024,DELAY_MINS from v$managed_standby;
